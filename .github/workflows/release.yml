@@ -7,6 +7,13 @@ name: Release
 # 发布内容：Release 构建（含图标/版本资源的单文件 DiskForge.exe）打包成
 # zip，附 SHA256 校验值，发布到仓库的 Releases 页面。重复发布同一个标签
 # 时只覆盖附件（--clobber），不会重复建 Release。
+#
+# Release Notes：自动生成（--generate-notes），基于上一个 tag 到当前 tag
+# 之间合并的 PR 标题/commit 自动整理成"What's Changed"列表，前面附一段
+# 固定的使用说明。无需手动维护 CHANGELOG.md。
+# 想要更完整的效果，建议改动尽量走 Pull Request 合并，并把 PR 标题写清楚，
+# 因为 GitHub 是按 PR 标题分组生成日志的；直接 push 到主分支的 commit
+# 也会被抓取，但排版不如 PR 标题整齐。
 
 on:
   workflow_dispatch:
@@ -24,6 +31,8 @@ jobs:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # 拉取完整历史，--generate-notes 需要用它对比上一个 tag
 
       - name: Install Rust stable
         uses: dtolnay/rust-toolchain@stable
@@ -49,17 +58,20 @@ jobs:
           fi
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
 
+      # windows-latest runner 上没有原生 zip 命令，改用 PowerShell 自带的
+      # Compress-Archive，无需安装任何第三方工具。
       - name: Package
-        shell: bash
+        shell: pwsh
         env:
           TAG: ${{ steps.ver.outputs.tag }}
         run: |
-          STAGE="DiskForge-${TAG}-windows-x64"
-          mkdir "$STAGE"
-          cp target/release/DiskForge.exe "$STAGE/"
-          cp README.md LICENSE "$STAGE/"
-          zip -r "$STAGE.zip" "$STAGE"
-          sha256sum "$STAGE.zip" > "$STAGE.zip.sha256"
+          $STAGE = "DiskForge-$env:TAG-windows-x64"
+          New-Item -ItemType Directory -Path $STAGE | Out-Null
+          Copy-Item target/release/DiskForge.exe $STAGE/
+          Copy-Item README.md, LICENSE $STAGE/
+          Compress-Archive -Path $STAGE -DestinationPath "$STAGE.zip"
+          $hash = (Get-FileHash "$STAGE.zip" -Algorithm SHA256).Hash.ToLower()
+          "$hash  $STAGE.zip" | Out-File -FilePath "$STAGE.zip.sha256" -Encoding ascii -NoNewline
 
       - name: Publish to GitHub Releases
         shell: bash
@@ -68,12 +80,11 @@ jobs:
           TAG: ${{ steps.ver.outputs.tag }}
           ZIP: DiskForge-${{ steps.ver.outputs.tag }}-windows-x64.zip
         run: |
-          cat > release_notes.md <<'EOF'
+          cat > release_notes_header.md <<'EOF'
           免费、单文件、免安装的 Windows 磁盘空间分析器。
 
           - 下载下方 zip，解压后双击 `DiskForge.exe` 即可运行（无需安装）
           - 想要极速扫描请右键选择"以管理员身份运行"
-          - 更新内容见 CHANGELOG.md
           EOF
           if gh release view "$TAG" >/dev/null 2>&1; then
             gh release upload "$TAG" "$ZIP" "$ZIP.sha256" --clobber
@@ -81,5 +92,6 @@ jobs:
             gh release create "$TAG" "$ZIP" "$ZIP.sha256" \
               --target "$GITHUB_SHA" \
               --title "DiskForge $TAG" \
-              --notes-file release_notes.md
+              --notes-file release_notes_header.md \
+              --generate-notes
           fi
