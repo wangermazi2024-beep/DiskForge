@@ -21,3 +21,4 @@ desktop.ini
 disklens_log.txt
 Cargo.lock
 *.py
+*.log

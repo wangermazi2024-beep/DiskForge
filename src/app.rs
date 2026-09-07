@@ -2314,7 +2314,7 @@ impl DiskForgeApp {
                 );
                 ui.add_space(6.0);
                 ui.label(
-                    egui::RichText::new("✅ 创建成功后，DiskForge 会在真实数据所在目录生成「DiskForge_还原_时间.bat」一键还原脚本；万一某个软件出问题，到该目录双击运行脚本，即可把数据还原回原位置（还原前请先关闭相关软件）。")
+                    egui::RichText::new("✅ 创建成功后，DiskForge 会在真实数据所在目录生成「DiskForge还原符号链接.bat」一键还原脚本；万一某个软件出问题，到该目录双击运行（会自动申请管理员权限），即可按记录把数据一键还原回原位置（还原前请先关闭相关软件）。")
                         .size(12.0),
                 );
                 ui.add_space(6.0);
