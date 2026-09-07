@@ -1,6 +1,6 @@
 ﻿[package]
 name = "diskforge"
-version = "0.1.6"
+version = "0.1.7"
 edition = "2024"
 description = "DiskForge — 免费的 Windows NTFS 磁盘空间与文件分析器"
 authors = ["WMS <wumingshifn@gmail.com>"]
@@ -88,3 +88,12 @@ windows-sys = { version = "0.59", features = [
 name = "DiskForge"
 path = "src/main.rs"
 required-features = ["gui"]
+
+# 发布版瘦身：去掉符号表（strip）+ 链接期优化（LTO）+ 单代码生成单元。
+# 发布版 exe 从约 11MB 降到约 7MB，LTO 对运行速度无负面影响甚至略快。
+# 注意：故意不设 panic = "abort"——abort 走 fastfail 会绕过
+# SetUnhandledExceptionFilter，导致 crash_logger 收不到任何信息。
+[profile.release]
+strip = true
+lto = true
+codegen-units = 1
