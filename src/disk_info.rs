@@ -1,4 +1,3 @@
-//! 磁盘分区枚举（Windows: GetLogicalDriveStringsW + GetVolumeInformationW + GetDiskFreeSpaceExW）。
 
 #[derive(Clone, Debug, Default)]
 pub struct DiskInfo {
@@ -21,10 +20,6 @@ impl DiskInfo {
     pub fn root_path(&self) -> String { format!("{}:\\", self.drive_letter) }
 }
 
-/// 只列出固定磁盘的盘符，不查询任何容量/卷标信息（不调用 GetDiskFreeSpaceExW /
-/// GetVolumeInformationW）。给启动时的"选择分区"界面用：用户还没点"开始扫描"之前，
-/// 程序不应该主动去查任何一个分区的实际数据——所有数据都应该是扫描之后才产生的，
-/// 而不是一启动就默默地把每个分区的大小都算一遍。
 #[cfg(windows)]
 pub fn list_fixed_drive_letters() -> Vec<char> {
     use windows_sys::Win32::Storage::FileSystem::{GetDriveTypeW, GetLogicalDriveStringsW};
@@ -50,10 +45,6 @@ pub fn list_fixed_drive_letters() -> Vec<char> {
 #[cfg(not(windows))]
 pub fn list_fixed_drive_letters() -> Vec<char> { Vec::new() }
 
-/// 只列出固定磁盘的盘符 + 卷标，不查容量（不调用 GetDiskFreeSpaceExW）。
-/// 卷标查询（GetVolumeInformationW）本身很轻量，只是个名字，不算"扫描数据"——
-/// 给启动选择界面用真实卷名（没有卷标的盘就是 None，界面上退化成"本地磁盘"），
-/// 而不是不管有没有卷名一律显示"本地磁盘 (C:)"。
 #[cfg(windows)]
 pub fn list_fixed_drives_with_labels() -> Vec<(char, Option<String>)> {
     use windows_sys::Win32::Storage::FileSystem::GetVolumeInformationW;

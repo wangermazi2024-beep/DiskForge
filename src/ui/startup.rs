@@ -1,15 +1,8 @@
-//! "选择要扫描的分区/目录"界面。
-//!
-//! 首次启动时占满整个窗口显示；用户扫完一批之后想再追加扫描目标时，
-//! 同一套状态和渲染逻辑也会以浮动窗口的形式复用（见 `app.rs` 的"文件 > 添加扫描…"）。
-//! 分区列表带真实卷名（GetVolumeInformationW，很轻量，不算"扫描数据"），没有卷名的盘
-//! 才退化显示"本地磁盘"；在用户点"开始扫描"之前不会查询任何分区的容量信息。
 
 use std::collections::HashSet;
 use egui::{Color32, RichText};
 
 pub struct PickerState {
-    /// 系统里有哪些固定磁盘盘符 + 真实卷名（没有卷名的是 None，界面上退化成"本地磁盘"）。
     pub available_drives: Vec<(char, Option<String>)>,
     pub selected_drives: HashSet<char>,
     pub custom_paths: Vec<String>,
@@ -31,9 +24,6 @@ pub enum PickerAction {
     Cancel,
 }
 
-/// 渲染选择界面的内容（不含外层容器——调用方决定是放在 CentralPanel 里全屏显示，
-/// 还是放在一个浮动 Window 里）。`show_cancel` 控制要不要显示"取消"按钮
-/// （首次启动没有已有结果可以取消回去，追加扫描时才需要）。
 pub fn show(ui: &mut egui::Ui, state: &mut PickerState, show_cancel: bool) -> PickerAction {
     let mut action = PickerAction::None;
 

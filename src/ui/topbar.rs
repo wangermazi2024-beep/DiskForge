@@ -1,5 +1,3 @@
-//! 顶部菜单栏：文件 / 视图 / 分析 / 查找 / 关于，管理员按钮常驻在菜单右边（不是菜单里的一项，
-//! 一直看得见点得到），品牌标题和版权信息在窗口左下角的状态条（见 app.rs）。
 
 use egui::{Color32, RichText};
 
@@ -8,19 +6,11 @@ pub enum TopbarAction {
     AddScan,
     ExportCsv,
     ToggleShowAll,
-    /// 打开"文件扩展名分类"标签页（单分区入口走列表右键菜单）。
     ShowExtensionBreakdown,
     ShowDuplicateFinder,
-    /// 打开"查找"悬浮窗（在当前标签页原来的树里定位某一项，不改变列表内容）。
     OpenFind,
-    /// 打开一个新的"搜索"标签页（复制当前数据快照，摊平列出/筛选/排序/操作）。
     OpenSearchTab,
-    /// 顶部菜单"复制列表"：把当前数据整个克隆一份开成新标签页，画面和主
-    /// 列表一样的可展开树，支持重新扫描/移除分区等和主列表完全相同的操作，
-    /// 但操作的是独立副本，不会影响主列表。
     OpenCopyTab,
-    /// 打开"关于 DiskForge"悬浮窗（版权/许可/赞助信息；与首次启动的赞助提示
-    /// 复用同一个悬浮窗，但不受"不再提醒"持久化影响——菜单入口始终可看）。
     OpenAbout,
     #[cfg(windows)]
     RestartAsAdmin,
@@ -122,8 +112,6 @@ pub fn show(ui: &mut egui::Ui, state: TopbarState) -> TopbarAction {
 
                 ui.separator();
 
-                // 管理员按钮常驻在菜单右边，不藏进下拉菜单里——这是一个状态提示 +
-                // 一键操作，不是"菜单类"功能，放在菜单里反而不容易被注意到。
                 #[cfg(windows)]
                 if !state.is_admin {
                     let btn = egui::Button::new(RichText::new("⚡ 以管理员身份运行").color(Color32::from_rgb(0x2A, 0x2A, 0x2E)).strong())

@@ -1,10 +1,3 @@
-//! 左侧边栏：磁盘概览（选中分区的已用/剩余比例）+ 分类统计（按扩展名归类的大类占比）
-//! + 两个分析功能的入口（文件扩展名分类 / 重复文件查找，点了在主区域开新标签页）。
-//!
-//! 之前这里还有一块"空间统计"文字（逻辑大小/物理大小/系统已用/剩余空间/文件/文件夹），
-//! 那部分现在改成扫描完成时打印到日志——原因是现在支持同时扫多个分区，塞在侧边栏里
-//! 既放不下也没意义（到底显示哪个分区的？），而且这些数字列表本身也能看到。
-//! 概览图和分类统计还留着，不然界面太单调。
 
 use egui::{Color32, Rect, RichText, Vec2};
 use crate::disk_info::DiskInfo;
@@ -19,9 +12,6 @@ pub enum SidebarAction {
     OpenDuplicates,
 }
 
-/// `focused`：当前"聚焦"的分区/目录（一般是用户选中的那个，没选中就用第一个）。
-/// `categories`：调用方缓存好的分类统计（扫描完成时算一次，不在这里现算——
-/// 分类统计要遍历整棵树，放在每帧都执行的侧边栏里现算会明显卡顿）。
 pub fn show(ui: &mut egui::Ui, focused: Option<&Node>, info: Option<&DiskInfo>, categories: Option<&[CategoryStat]>) -> SidebarAction {
     let mut action = SidebarAction::None;
     ui.add_space(10.0);
@@ -42,7 +32,6 @@ pub fn show(ui: &mut egui::Ui, focused: Option<&Node>, info: Option<&DiskInfo>, 
             });
         }
         (Some(node), _) => {
-            // 自定义目录扫描：没有"整个分区容量"的概念，只显示扫到的大小占了个什么样。
             ui.vertical_centered(|ui| {
                 ui.label(RichText::new(&node.name).size(12.5).strong());
                 ui.label(RichText::new(format!("已扫描 {}", human_size(node.logical_size)))
