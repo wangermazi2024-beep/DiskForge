@@ -105,4 +105,4 @@ DiskForge 是免费软件，开发与维护全凭热情。如果它帮你找回�
 
 ## 更新日志
 
-见 [CHANGELOG.md](CHANGELOG.md)。当前版本：**v0.1.0 Beta**（首个公开测试版）。
+见 [CHANGELOG.md](CHANGELOG.md)。当前版本：**v0.1.1 Beta**。
