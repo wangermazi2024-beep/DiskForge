@@ -255,7 +255,7 @@ fn reveal_in_view_tree(
     *selected = Some(path);
 }
 
-pub struct DiskUiApp {
+pub struct DiskForgeApp {
     partitions: Vec<Node>,
     partition_infos: Vec<Option<DiskInfo>>,
     partition_categories: Vec<Vec<CategoryStat>>,
@@ -384,7 +384,7 @@ impl FindState {
     }
 }
 
-impl DiskUiApp {
+impl DiskForgeApp {
     pub fn new(textures: AboutTextures) -> Self {
         let drives = disk_info::list_fixed_drives_with_labels();
         let about = if crate::about::is_sponsor_suppressed() {
@@ -433,7 +433,7 @@ impl DiskUiApp {
     }
 }
 
-impl eframe::App for DiskUiApp {
+impl eframe::App for DiskForgeApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         ui.ctx().set_visuals(egui::Visuals::dark());
         self.poll_scan();
@@ -476,7 +476,7 @@ impl eframe::App for DiskUiApp {
     }
 }
 
-impl DiskUiApp {
+impl DiskForgeApp {
     fn show_main_screen(&mut self, ui: &mut egui::Ui) {
         let action = topbar::show(ui, TopbarState {
             scanning: self.scanning,

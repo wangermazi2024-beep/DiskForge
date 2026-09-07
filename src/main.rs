@@ -5,7 +5,7 @@ pub use diskforge::mft_scan;
 
 mod app;
 mod ui;
-use app::{AboutTextures, DiskUiApp};
+use app::{AboutTextures, DiskForgeApp};
 
 fn load_png_texture(ctx: &egui::Context, name: &str, bytes: &[u8]) -> egui::TextureHandle {
     let img = image::load_from_memory(bytes)
@@ -95,6 +95,6 @@ fn main() -> eframe::Result<()> {
     eframe::run_native(about::APP_NAME, options, Box::new(|cc| {
         setup_fonts(&cc.egui_ctx);
         let textures = setup_about_textures(&cc.egui_ctx);
-        Ok(Box::new(DiskUiApp::new(textures)))
+        Ok(Box::new(DiskForgeApp::new(textures)))
     }))
 }
