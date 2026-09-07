@@ -1,10 +1,11 @@
 # Changelog
 
-## v0.1.1 (Beta)
+## v0.1.2 (Beta)
 
 ### 修复与优化
 
 - 符号链接真实路径解析改用 Windows 官方 API（CreateFileW + GetFinalPathNameByHandleW），由内核一步解析整条链接链，不再有任何层数硬编码限制；断链/权限不足时直接明确报错
+- 解析函数经二次评审微调：句柄生命周期用闭包收紧（任何提前退出都先于 CloseHandle），修正缓冲区扩容注释，并补充 Windows 内核"单路径最多 63 个 reparse 点"的系统级边界说明
 - 一键还原脚本重构为 bat + ps1 + csv 三件套：bat 入口内容纯 ASCII（彻底杜绝中文代码页乱码导致的命令错乱），并自动通过 UAC 申请管理员权限；PowerShell 脚本（UTF-8 BOM）按 CSV 记录全自动还原全部条目，无需逐条手选
 - 还原失败时提示"以管理员身份运行重试"，管理员也失败时指引打开 symlink_records.csv 按记录手动还原
 - 还原成功后明确提示：先确认相关软件运行正常，再自行删除 DiskForge 里的存档数据释放空间

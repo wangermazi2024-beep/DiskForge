@@ -220,18 +220,69 @@ pub struct RestoreEntry {
     pub is_dir: bool,
 }
 
-const RESTORE_BAT_NAME: &str = "DiskForge还原符号链接.bat";
-const RESTORE_PS1_NAME: &str = "restore_symlinks.ps1";
-const RESTORE_CSV_NAME: &str = "symlink_records.csv";
+const RESTORE_STEM_PREFIX: &str = "DiskForgeRestoreLink";
+
+/// 还原脚本三件套（bat/ps1/csv）共用文件主干名：
+/// - 文件夹迁移（有 display_name）：`{主名}_{源文件夹名}({目录哈希8位})_{时间戳}`
+///   ——多个文件夹的脚本会放在同一个 `{base}\{盘符}\` 目录里，带源名才能一眼辨认
+/// - 文件迁移（无 display_name）：`{主名}_{内容哈希8位}_{时间戳}`
+///   ——脚本在内容哈希目录里，不同名但内容相同的文件共享同一目录，带某个
+///   文件名反而误导；用户直接搜索真实数据文件即可定位
+///
+/// 同目录同主题固定同名（重复迁移时覆盖复用、CSV 累计去重）。
+fn restore_stem(dir: &Path, display_name: Option<&str>) -> String {
+    // 清理 Windows 文件名非法字符
+    let safe = |s: &str| -> String {
+        s.chars()
+            .map(|c| if matches!(c, '\\' | '/' | ':' | '*' | '?' | '"' | '<' | '>' | '|') { '_' } else { c })
+            .collect()
+    };
+    // 同目录已有同类三件套时复用其整个主干名，保证同主题始终只有一套文件
+    if let Ok(rd) = std::fs::read_dir(dir) {
+        for item in rd.flatten() {
+            let name = item.file_name().to_string_lossy().into_owned();
+            let Some(rest) = name
+                .strip_prefix(RESTORE_STEM_PREFIX)
+                .and_then(|r| r.strip_suffix(".bat"))
+                .filter(|r| r.starts_with('_'))
+            else {
+                continue;
+            };
+            let kind_match = match display_name {
+                // 文件夹：只复用"同名文件夹"的那套脚本（名字后面必须紧跟 8 位哈希）
+                Some(src) => rest
+                    .strip_prefix(&format!("_{}_", safe(src)))
+                    .is_some_and(|h| h.len() > 9 && h.as_bytes()[8] == b'_' && h[..8].bytes().all(|b| b.is_ascii_hexdigit())),
+                // 文件：只复用不带文件夹名的主干（内容哈希目录），即 _哈希8位_时间戳
+                None => rest.len() > 9
+                    && rest.as_bytes()[9] == b'_'
+                    && rest[1..9].bytes().all(|b| b.is_ascii_hexdigit()),
+            };
+            if kind_match {
+                return format!("{RESTORE_STEM_PREFIX}{rest}");
+            }
+        }
+    }
+    let hash8 = &blake3::hash(dir.to_string_lossy().as_bytes()).to_hex()[..8];
+    let ts = chrono::Local::now().format("%Y%m%d_%H%M%S").to_string();
+    match display_name {
+        Some(src) => format!("{RESTORE_STEM_PREFIX}_{}_{hash8}_{ts}", safe(src)),
+        None => format!("{RESTORE_STEM_PREFIX}_{hash8}_{ts}"),
+    }
+}
 
 /// 根据创建符号链接的记录，在真实数据所在目录（第一个记录的 target 的上级
 /// 目录）生成"一键还原"脚本三件套：
-///   1. DiskForge还原符号链接.bat —— 双击入口，内容纯 ASCII（任何代码页都不会
-///      乱码），自动通过 UAC 申请管理员权限（受保护目录还原必需），然后调用
-///   2. restore_symlinks.ps1 —— UTF-8+BOM（中文安全），读取
-///   3. symlink_records.csv —— UTF-8+BOM 的还原记录（可累计多批，按链接去重）
+///
+/// 1. DiskForgeRestoreLink_文件夹名_哈希_*.bat —— 文件夹迁移用（带源名便于辨认）
+/// 2. DiskForgeRestoreLink_哈希_*.bat / .ps1 / .csv —— 文件迁移用（不带文件名，
+///    因为不同名但内容相同的重复文件共享同一个内容哈希目录）
+///    双击入口内容纯 ASCII（任何代码页都不会乱码），自动通过 UAC 申请管理员权限
+/// 3. CSV —— UTF-8+BOM 的还原记录（可累计多批，按链接去重），ps1 一次性全部还原
+///
 /// ps1 会一次性自动还原 CSV 里的全部记录（不用一条条手选），即创建符号链接
 /// 的反向操作：删链接 -> 把真实数据复制回原位置。
+///
 /// 返回 bat 的完整路径。
 pub fn write_restore_bat(entries: &[RestoreEntry]) -> Result<String, String> {
     let Some(first) = entries.first() else {
@@ -243,20 +294,31 @@ pub fn write_restore_bat(entries: &[RestoreEntry]) -> Result<String, String> {
     std::fs::create_dir_all(dir).map_err(|e| format!("创建还原脚本目录失败: {e}"))?;
 
     // 1) bat 启动器：纯 ASCII + CRLF，永远不会因为代码页/中文乱码而出错
-    let bat_path = dir.join(RESTORE_BAT_NAME);
-    if !bat_path.exists() {
-        std::fs::write(&bat_path, RESTORE_BAT_CONTENT.replace('\n', "\r\n"))
-            .map_err(|e| format!("写还原启动脚本 {RESTORE_BAT_NAME} 失败: {e}"))?;
-    }
+    // 文件夹迁移带源文件夹名（多套脚本共目录时便于辨认）；文件迁移不带
+    //（内容哈希目录里可能有多套不同名重复文件的脚本，避免误导）
+    let display_name = if first.is_dir {
+        Path::new(&first.link_path)
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+    } else {
+        None
+    };
+    let stem = restore_stem(dir, display_name.as_deref());
+    let bat_name = format!("{stem}.bat");
+    let ps1_name = format!("{stem}.ps1");
+    let csv_name = format!("{stem}.csv");
+    let bat_path = dir.join(&bat_name);
+    let bat = RESTORE_BAT_CONTENT.replace("__RESTORE_PS1_NAME__", &ps1_name);
+    std::fs::write(&bat_path, bat.replace('\n', "\r\n"))
+        .map_err(|e| format!("写还原启动脚本 {bat_name} 失败: {e}"))?;
     // 2) ps1 还原脚本：UTF-8 + BOM，Windows PowerShell 5.1 能正确解析中文
-    let ps1_path = dir.join(RESTORE_PS1_NAME);
-    if !ps1_path.exists() {
-        let mut bytes: Vec<u8> = vec![0xEF, 0xBB, 0xBF];
-        bytes.extend_from_slice(RESTORE_PS1_CONTENT.replace('\n', "\r\n").as_bytes());
-        std::fs::write(&ps1_path, bytes).map_err(|e| format!("写还原脚本 {RESTORE_PS1_NAME} 失败: {e}"))?;
-    }
+    let ps1_path = dir.join(&ps1_name);
+    let ps1 = RESTORE_PS1_CONTENT.replace("__RESTORE_CSV_NAME__", &csv_name);
+    let mut bytes: Vec<u8> = vec![0xEF, 0xBB, 0xBF];
+    bytes.extend_from_slice(ps1.replace('\n', "\r\n").as_bytes());
+    std::fs::write(&ps1_path, bytes).map_err(|e| format!("写还原脚本 {ps1_name} 失败: {e}"))?;
     // 3) CSV 还原记录：按 (链接,目标,类型) 去重后追加，支持多批累计
-    append_restore_csv(dir, entries)?;
+    append_restore_csv(dir, &csv_name, entries)?;
 
     let p = bat_path.to_string_lossy().into_owned();
     crate::applog::log(&format!("[file_ops] 已更新一键还原脚本: {p}（本次 {} 条还原记录）", entries.len()));
@@ -273,11 +335,11 @@ fn csv_line(fields: &[&str]) -> String {
     line
 }
 
-fn append_restore_csv(dir: &Path, entries: &[RestoreEntry]) -> Result<(), String> {
+fn append_restore_csv(dir: &Path, csv_name: &str, entries: &[RestoreEntry]) -> Result<(), String> {
     use std::collections::HashSet;
     use std::io::Write;
 
-    let csv_path = dir.join(RESTORE_CSV_NAME);
+    let csv_path = dir.join(csv_name);
     let mut existing_keys: HashSet<String> = HashSet::new();
     if csv_path.exists() {
         let bytes = std::fs::read(&csv_path).map_err(|e| format!("读取还原记录 CSV 失败: {e}"))?;
@@ -346,12 +408,12 @@ if %errorlevel% neq 0 (
     echo     this bat and choose "Run as administrator".
     echo.
 )
-powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0restore_symlinks.ps1"
+powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0__RESTORE_PS1_NAME__"
 "#;
 
 const RESTORE_PS1_CONTENT: &str = r##"# ============================================================
 #  DiskForge 一键还原符号链接脚本（由 DiskForge 自动生成）
-#  用法：双击同目录下的 DiskForge还原符号链接.bat（会自动申请管理员权限）
+#  用法：双击同目录下的 DiskForgeRestoreLink_*.bat（会自动申请管理员权限）
 #  作用：把本目录 symlink_records.csv 里记录的符号链接【全部自动】还原成
 #        真实文件/文件夹（删除链接 -> 把 DiskForge 里的存档数据复制回原位）
 #  说明：还原成功后 DiskForge 里的存档副本仍会保留。请先确认相关软件一切
@@ -359,7 +421,7 @@ const RESTORE_PS1_CONTENT: &str = r##"# ========================================
 # ============================================================
 
 $ErrorActionPreference = 'Continue'
-$csvPath = Join-Path $PSScriptRoot 'symlink_records.csv'
+$csvPath = Join-Path $PSScriptRoot '__RESTORE_CSV_NAME__'
 
 Write-Host ''
 Write-Host 'DiskForge 符号链接一键还原' -ForegroundColor Cyan
@@ -369,7 +431,7 @@ $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
 $isAdmin = ([Security.Principal.WindowsPrincipal]$identity).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 if (-not $isAdmin) {
     Write-Host '[提示] 当前不是管理员权限，还原受保护目录（如 Program Files）可能失败。' -ForegroundColor Yellow
-    Write-Host '       建议关闭本窗口，右键 DiskForge还原符号链接.bat 选择"以管理员身份运行"。' -ForegroundColor Yellow
+    Write-Host '       建议关闭本窗口，右键本目录下的 .bat 文件选择"以管理员身份运行"。' -ForegroundColor Yellow
 }
 
 if (-not (Test-Path -LiteralPath $csvPath)) {
@@ -405,7 +467,7 @@ for ($i = 0; $i -lt $records.Count; $i++) {
     $target = $r.target_path
     $typeName = '文件'
     if ($r.type -eq 'dir') { $typeName = '文件夹' }
-    Write-Host "[ $($i + 1)/$($records.Count) ] 还原$typeName: $link"
+    Write-Host "[ $($i + 1)/$($records.Count) ] 还原${typeName}: $link"
 
     try {
         $item = Get-Item -LiteralPath $link -Force -ErrorAction SilentlyContinue
@@ -428,7 +490,9 @@ for ($i = 0; $i -lt $records.Count; $i++) {
             continue
         }
         if ($r.type -eq 'dir') {
-            Copy-Item -LiteralPath $target -Destination $link -Recurse -Force
+            # robocopy /SL：镜像里的符号链接/junction 子项原样还原成链接（不跟随复制内容）
+            robocopy "$target" "$link" /E /SL /R:2 /W:1 /NFL /NDL /NJH /NJS | Out-Null
+            if ($LASTEXITCODE -gt 7) { throw "robocopy 复制失败（代码 $LASTEXITCODE）" }
         } else {
             $parent = Split-Path -Parent $link
             if (-not (Test-Path -LiteralPath $parent)) { New-Item -ItemType Directory -Path $parent -Force | Out-Null }
@@ -449,8 +513,8 @@ if ($failed -eq 0) {
     Write-Host '全部还原成功！DiskForge 里对应的存档副本已不再被链接使用。' -ForegroundColor Green
     Write-Host '请先确认相关软件运行正常，确认无误后可自行删除 DiskForge 里对应的真实数据文件夹来释放空间。'
 } else {
-    Write-Host '有还原失败的项。最常见原因是权限不够：请右键 DiskForge还原符号链接.bat，选择"以管理员身份运行"后重试。' -ForegroundColor Yellow
-    Write-Host '如果以管理员身份运行后仍然失败，请用记事本打开本目录下的 symlink_records.csv，' -ForegroundColor Yellow
+    Write-Host '有还原失败的项。最常见原因是权限不够：请右键本目录下的 .bat 文件，选择"以管理员身份运行"后重试。' -ForegroundColor Yellow
+    Write-Host '如果以管理员身份运行后仍然失败，请用记事本打开本目录下的 .csv 记录文件，' -ForegroundColor Yellow
     Write-Host '按每行记录的 link_path（链接位置）和 target_path（真实数据位置）手动复制还原。' -ForegroundColor Yellow
 }
 Read-Host '按回车键退出' | Out-Null
@@ -459,13 +523,16 @@ Read-Host '按回车键退出' | Out-Null
 /// 用 Windows 官方 API 一步解析符号链接/junction/挂载点的最终真实路径。
 ///
 /// 原理（微软文档明确说明"最终路径就是路径被完全解析后的结果"）：
-///   1. CreateFileW 打开路径：desiredAccess=0（仅查询元数据，权限要求最低），
-///      FILE_FLAG_BACKUP_SEMANTICS（让目录链接也能打开）、且【不加】
-///      FILE_FLAG_OPEN_REPARSE_POINT——这样内核会沿符号链接/junction 链
-///      一路跟到底，拿到的句柄就是最终真实目标的句柄，层数由文件系统内核
-///      处理（含循环链接检测），没有任何人为的硬编码限制；
-///   2. GetFinalPathNameByHandleW(VOLUME_NAME_DOS) 直接取回最终路径。
-///   .NET 运行时（System.IO）解析链接目标用的正是同一套调用方式。
+///
+/// 1. CreateFileW 打开路径：desiredAccess=0（仅查询元数据，权限要求最低）、
+///    FILE_FLAG_BACKUP_SEMANTICS（让目录链接也能打开）、且【不加】
+///    FILE_FLAG_OPEN_REPARSE_POINT——这样内核会沿符号链接/junction 链一路
+///    跟到底，拿到的句柄就是最终真实目标的句柄，层数由文件系统内核处理
+///    （含循环链接检测；Windows 内核对一条路径最多解析 63 个 reparse 点，
+///    那是操作系统自身的边界，不是代码里的人为限制）。
+/// 2. GetFinalPathNameByHandleW(VOLUME_NAME_DOS) 直接取回最终路径。
+///
+/// .NET 运行时（System.IO）解析链接目标用的正是同一套调用方式。
 /// 打不开（断链/权限不足/目标离线）就直接失败，不做任何凑合的降级。
 #[cfg(windows)]
 pub fn resolve_symlink_target(path: &str) -> Result<String, String> {
@@ -495,21 +562,25 @@ pub fn resolve_symlink_target(path: &str) -> Result<String, String> {
         ));
     }
 
-    // 缓冲区按需增长：返回值 0 = 真错误；返回值 >= 缓冲区大小 = 所需大小（含结尾 null），
-    // 按它精确扩容重试一次，对任意长度的路径都没有限制
-    let mut size: u32 = 0x1000;
-    let result: Result<String, String> = loop {
-        let mut buf = vec![0u16; size as usize];
-        let ret = unsafe { GetFinalPathNameByHandleW(handle, buf.as_mut_ptr(), size, VOLUME_NAME_DOS) };
-        if ret == 0 {
-            break Err(format!("获取最终路径失败（Win32 错误码 {}）", unsafe { GetLastError() }));
+    // 缓冲区不设人为长度上限，按 Win32 返回值动态扩容：
+    // 返回 0 = 真错误；返回值 >= 缓冲区大小 = 所需大小（含结尾 null），按它
+    // 扩容后重试；返回值 < 缓冲区大小 = 成功（实际长度不含结尾 null）。
+    // 用闭包包住循环，保证扩容过程中任何提前退出都发生在 CloseHandle 之前。
+    let result: Result<String, String> = (|| {
+        let mut size: u32 = 0x1000;
+        loop {
+            let mut buf = vec![0u16; size as usize];
+            let ret = unsafe { GetFinalPathNameByHandleW(handle, buf.as_mut_ptr(), size, VOLUME_NAME_DOS) };
+            if ret == 0 {
+                return Err(format!("获取最终路径失败（Win32 错误码 {}）", unsafe { GetLastError() }));
+            }
+            if (ret as usize) < buf.len() {
+                buf.truncate(ret as usize);
+                return Ok(String::from_utf16_lossy(&buf));
+            }
+            size = ret;
         }
-        if (ret as usize) < buf.len() {
-            buf.truncate(ret as usize);
-            break Ok(String::from_utf16_lossy(&buf));
-        }
-        size = ret;
-    };
+    })();
     unsafe { CloseHandle(handle) };
 
     let final_path = result?;
@@ -590,7 +661,13 @@ pub fn migrate_file_to_symlink(source_path: &str, base_dir: &str) -> Result<Stri
     Ok(target_path)
 }
 
-pub fn migrate_folder_to_symlink(source_path: &str, base_dir: &str) -> Result<String, String> {
+/// 迁移整个文件夹为符号链接。
+///
+/// `reparse_children_ok`：源文件夹里包含符号链接/junction 子项时是否继续
+/// （第一次尝试传 false——发现子项会返回 `REPARSE_CONFIRM::` 前缀的错误，
+/// 由 UI 弹窗让用户选择；用户确认后传 true 重试，复制时会跳过子链接的
+/// 内容并在镜像里重建同样目标的链接，还原时保持"是链接的还原成链接"）。
+pub fn migrate_folder_to_symlink(source_path: &str, base_dir: &str, reparse_children_ok: bool) -> Result<String, String> {
     match check_folder_occupied_by_rename(source_path) {
         FolderOccupancy::Free => {}
         FolderOccupancy::Locked => {
@@ -610,12 +687,18 @@ pub fn migrate_folder_to_symlink(source_path: &str, base_dir: &str) -> Result<St
         return Err(msg);
     }
     if let Some(offender) = find_reparse_entry(Path::new(source_path), source_path)
-        .map_err(|e| format!("预扫源文件夹失败（未做任何改动）: {e}"))? {
-        let msg = format!(
-            "文件夹里包含符号链接/junction/OneDrive 占位项（{offender}），这类条目无法被安全地复制到别的盘——为避免迁出一份不完整的镜像，已中止迁移，原文件夹未受任何影响。可以先用资源管理器/检测占用处理这些条目后再迁移剩下的部分"
-        );
-        crate::applog::log(&format!("[file_ops] 迁移文件夹中止（发现 reparse 子项）: {source_path}: {offender}"));
-        return Err(msg);
+        .map_err(|e| format!("预扫源文件夹失败（未做任何改动）: {e}"))?
+    {
+        if !reparse_children_ok {
+            // 不直接失败，交给 UI 弹窗让用户决定（继续/终止）
+            crate::applog::log(&format!(
+                "[file_ops] 迁移文件夹发现 reparse 子项，等待用户确认: {source_path}: {offender}"
+            ));
+            return Err(format!("REPARSE_CONFIRM::{offender}"));
+        }
+        crate::applog::log(&format!(
+            "[file_ops] 迁移文件夹：用户已确认继续，子链接只重建链接、不复制内容: {source_path}: {offender}"
+        ));
     }
     let dst = Path::new(&target_path);
     let Some(parent) = dst.parent() else {
@@ -624,7 +707,7 @@ pub fn migrate_folder_to_symlink(source_path: &str, base_dir: &str) -> Result<St
     std::fs::create_dir_all(parent).map_err(|e| format!("创建目标目录失败: {e}"))?;
 
     let src = Path::new(source_path);
-    if let Err(e) = copy_dir_recursive(src, dst) {
+    if let Err(e) = copy_dir_recursive(src, dst, reparse_children_ok) {
         let _ = std::fs::remove_dir_all(dst);
         let msg = format!("复制文件夹失败: {e}");
         crate::applog::log(&format!("[file_ops] 迁移文件夹失败，已清理残留目标: {source_path} -> {target_path}: {msg}"));
@@ -679,21 +762,51 @@ fn find_reparse_entry(_root: &Path, _root_display: &str) -> Result<Option<String
     Ok(None)
 }
 
-fn copy_dir_recursive(src: &Path, dst: &Path) -> std::io::Result<()> {
+fn copy_dir_recursive(src: &Path, dst: &Path, reparse_ok: bool) -> std::io::Result<()> {
     std::fs::create_dir_all(dst)?;
     let mut stack: Vec<(std::path::PathBuf, std::path::PathBuf)> = vec![(src.to_path_buf(), dst.to_path_buf())];
     while let Some((src_dir, dst_dir)) = stack.pop() {
         for entry in std::fs::read_dir(&src_dir)? {
             let entry = entry?;
-            let file_type = entry.file_type()?;
             let dst_path = dst_dir.join(entry.file_name());
-            if file_type.is_symlink() {
+            #[cfg(windows)]
+            {
+                // Windows 上符号链接/junction/OneDrive 占位项都是 reparse point。
+                // 用户确认后（reparse_ok=true）在镜像里重建同样目标的链接，
+                // 不复制链接指向的内容——还原时才能保持"是链接的还原成链接"。
+                use std::os::windows::fs::MetadataExt;
+                let md = entry.metadata()?;
+                if md.file_attributes() & crate::fs_attrs::FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+                    if reparse_ok {
+                        let raw = std::fs::read_link(entry.path())?;
+                        let target = raw.to_string_lossy().into_owned();
+                        let target = target.strip_prefix(r"\??\").map(str::to_string).unwrap_or(target);
+                        let is_dir = md.file_type().is_dir();
+                        create_symlink(&dst_path.to_string_lossy(), &target, is_dir)
+                            .map_err(std::io::Error::other)?;
+                    }
+                    continue;
+                }
+                let file_type = md.file_type();
+                if file_type.is_dir() {
+                    std::fs::create_dir_all(&dst_path)?;
+                    stack.push((entry.path(), dst_path));
+                } else if file_type.is_file() {
+                    std::fs::copy(entry.path(), &dst_path)?;
+                }
                 continue;
-            } else if file_type.is_dir() {
-                std::fs::create_dir_all(&dst_path)?;
-                stack.push((entry.path(), dst_path));
-            } else if file_type.is_file() {
-                std::fs::copy(entry.path(), &dst_path)?;
+            }
+            #[cfg(not(windows))]
+            {
+                let file_type = entry.file_type()?;
+                if file_type.is_symlink() {
+                    continue;
+                } else if file_type.is_dir() {
+                    std::fs::create_dir_all(&dst_path)?;
+                    stack.push((entry.path(), dst_path));
+                } else if file_type.is_file() {
+                    std::fs::copy(entry.path(), &dst_path)?;
+                }
             }
         }
     }
@@ -707,14 +820,37 @@ fn count_dir(path: &Path) -> std::io::Result<(u64, u64)> {
     while let Some(dir) = stack.pop() {
         for entry in std::fs::read_dir(&dir)? {
             let entry = entry?;
-            let file_type = entry.file_type()?;
-            if file_type.is_symlink() {
+            #[cfg(windows)]
+            {
+                // reparse 项（符号链接/junction/占位文件）在源和镜像里都只按
+                // 链接本身计一个条目（不深入），两侧统计口径一致，校验才不会误报
+                use std::os::windows::fs::MetadataExt;
+                let md = entry.metadata()?;
+                if md.file_attributes() & crate::fs_attrs::FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+                    count += 1;
+                    continue;
+                }
+                let file_type = md.file_type();
+                if file_type.is_dir() {
+                    stack.push(entry.path());
+                } else if file_type.is_file() {
+                    count += 1;
+                    size += md.len();
+                }
                 continue;
-            } else if file_type.is_dir() {
-                stack.push(entry.path());
-            } else if file_type.is_file() {
-                count += 1;
-                size += entry.metadata()?.len();
+            }
+            #[cfg(not(windows))]
+            {
+                let file_type = entry.file_type()?;
+                if file_type.is_symlink() {
+                    count += 1;
+                    continue;
+                } else if file_type.is_dir() {
+                    stack.push(entry.path());
+                } else if file_type.is_file() {
+                    count += 1;
+                    size += entry.metadata()?.len();
+                }
             }
         }
     }

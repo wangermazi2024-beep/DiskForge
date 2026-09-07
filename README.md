@@ -2,7 +2,7 @@
 
 **免费、单文件、免安装的 Windows 磁盘空间分析器**——一眼看清硬盘空间都被谁吃了。
 
-由 [WMS](mailto:wumingshifn@gmail.com) 开发维护 · 版本 v0.1.0 Beta
+由 [WMS](mailto:wumingshifn@gmail.com) 开发维护 · 版本 v0.1.2 Beta
 
 ![DiskForge 主界面](docs/screenshot_main.png)
 

@@ -61,6 +61,7 @@ struct SymlinkRequest {
     name: String,
     full_path: String,
     is_folder: bool,
+    drive: char,
 }
 
 enum SymlinkOutcome {
@@ -301,6 +302,7 @@ pub struct DiskForgeApp {
     pending_symlink_pick: Option<PendingSymlinkKind>,
     symlink_pick_drives: Vec<(char, Option<String>)>,
     pending_symlink_confirm: Option<(PendingSymlinkKind, char)>,
+    pending_reparse_confirm: Option<(PendingSymlinkKind, char, String)>,
     symlink_done: Option<SymlinkDoneInfo>,
     symlink_reveal: Option<(String, String)>,
 
@@ -428,6 +430,7 @@ impl DiskForgeApp {
             pending_symlink_pick: None,
             symlink_pick_drives: Vec::new(),
             pending_symlink_confirm: None,
+            pending_reparse_confirm: None,
             symlink_done: None,
             symlink_reveal: None,
             lock_check_rx: None,
@@ -470,6 +473,9 @@ impl eframe::App for DiskForgeApp {
         }
         if self.pending_symlink_confirm.is_some() {
             self.show_symlink_confirm_modal(ui.ctx());
+        }
+        if self.pending_reparse_confirm.is_some() {
+            self.show_reparse_children_modal(ui.ctx());
         }
         if self.symlink_done.is_some() {
             self.show_symlink_done_modal(ui.ctx());
@@ -2172,7 +2178,7 @@ impl DiskForgeApp {
         self.pending_symlink_pick = Some(PendingSymlinkKind::Group { tab_idx, abs_path, name, member_paths });
     }
 
-    fn launch_symlink_job(&mut self, kind: PendingSymlinkKind, drive: char) {
+    fn launch_symlink_job(&mut self, kind: PendingSymlinkKind, drive: char, reparse_ok: bool) {
         let base_dir = crate::file_ops::diskforge_base_dir(drive);
         match kind {
             PendingSymlinkKind::Single { source, abs_path, name, full_path, is_folder } => {
@@ -2180,7 +2186,7 @@ impl DiskForgeApp {
                 let (tx, rx) = mpsc::channel();
                 std::thread::spawn(move || {
                     let result = if is_folder {
-                        crate::file_ops::migrate_folder_to_symlink(&full_path_for_thread, &base_dir)
+                        crate::file_ops::migrate_folder_to_symlink(&full_path_for_thread, &base_dir, reparse_ok)
                     } else {
                         crate::file_ops::migrate_file_to_symlink(&full_path_for_thread, &base_dir)
                     };
@@ -2196,7 +2202,7 @@ impl DiskForgeApp {
                     });
                     let _ = tx.send(outcome);
                 });
-                self.symlink_rx = Some((SymlinkRequest { source, abs_path, name, full_path, is_folder }, rx));
+                self.symlink_rx = Some((SymlinkRequest { source, abs_path, name, full_path, is_folder, drive }, rx));
             }
             PendingSymlinkKind::Group { tab_idx, abs_path, name, member_paths } => {
                 let (tx, rx) = mpsc::channel();
@@ -2228,7 +2234,7 @@ impl DiskForgeApp {
                     })();
                     let _ = tx.send(result);
                 });
-                self.symlink_rx = Some((SymlinkRequest { source: DeleteSource::Tab(tab_idx), abs_path, name, full_path: String::new(), is_folder: false }, rx));
+                self.symlink_rx = Some((SymlinkRequest { source: DeleteSource::Tab(tab_idx), abs_path, name, full_path: String::new(), is_folder: false, drive }, rx));
             }
         }
     }
@@ -2314,7 +2320,7 @@ impl DiskForgeApp {
                 );
                 ui.add_space(6.0);
                 ui.label(
-                    egui::RichText::new("✅ 创建成功后，DiskForge 会在真实数据所在目录生成「DiskForge还原符号链接.bat」一键还原脚本；万一某个软件出问题，到该目录双击运行（会自动申请管理员权限），即可按记录把数据一键还原回原位置（还原前请先关闭相关软件）。")
+                    egui::RichText::new("✅ 创建成功后，DiskForge 会在真实数据所在目录生成「DiskForgeRestoreLink_*.bat」一键还原脚本（文件夹迁移带源文件夹名便于辨认）；万一某个软件出问题，到该目录双击运行（会自动申请管理员权限），即可按记录把数据一键还原回原位置（还原前请先关闭相关软件）。")
                         .size(12.0),
                 );
                 ui.add_space(6.0);
@@ -2344,9 +2350,72 @@ impl DiskForgeApp {
             });
         if proceed {
             let (kind, drive) = self.pending_symlink_confirm.take().unwrap();
-            self.launch_symlink_job(kind, drive);
+            self.launch_symlink_job(kind, drive, false);
         } else if cancel {
             self.pending_symlink_confirm = None;
+        }
+    }
+
+    /// 文件夹迁移发现符号链接/junction 子项时的二次确认弹窗：
+    /// 继续 = 跳过子链接内容、在镜像里重建同样目标的链接（还原时保持链接原样）；
+    /// 终止 = 什么都不做。
+    fn show_reparse_children_modal(&mut self, ctx: &egui::Context) {
+        let Some((_, _, offender)) = &self.pending_reparse_confirm else { return };
+        let offender = offender.clone();
+        let mut proceed = false;
+        let mut cancel = false;
+        egui::Window::new("文件夹里包含符号链接")
+            .id(egui::Id::new("reparse_children_confirm"))
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+            .show(ctx, |ui| {
+                ui.set_min_width(470.0);
+                ui.colored_label(
+                    Color32::from_rgb(0xF5, 0xA6, 0x23),
+                    format!("⚠ 检测到文件夹里包含符号链接/junction/OneDrive 占位项：\n{offender}"),
+                );
+                ui.add_space(8.0);
+                ui.label("请选择如何处理：");
+                ui.label(
+                    egui::RichText::new("• 继续：迁移时【不复制】这些链接指向的内容（数据已在 DiskForge 里，不会重复占用空间），并在迁移出的镜像里重建同样目标的链接；以后一键还原时，是链接的条目会原样还原成链接。")
+                        .size(12.0),
+                );
+                ui.label(
+                    egui::RichText::new("• 终止：本次迁移不做任何改动，先自行处理这些链接后再迁移。")
+                        .size(12.0),
+                );
+                ui.add_space(10.0);
+                ui.separator();
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    let ok_btn = egui::Button::new(egui::RichText::new("✅ 继续（镜像里保留链接）").strong())
+                        .fill(crate::theme::ACCENT_BLUE)
+                        .corner_radius(egui::CornerRadius::same(6));
+                    if ui.add(ok_btn).clicked() {
+                        proceed = true;
+                    }
+                    if ui.button("终止").clicked() {
+                        cancel = true;
+                    }
+                });
+            });
+        if proceed || cancel {
+            let pending = self.pending_reparse_confirm.take().unwrap();
+            if proceed {
+                let (kind, drive, _) = pending;
+                crate::applog::log("[app] 用户确认：文件夹迁移继续，子链接在镜像中重建为链接");
+                self.launch_symlink_job(kind, drive, true);
+            } else {
+                let (kind, _, _) = pending;
+                crate::applog::log("[app] 用户终止：文件夹迁移已取消（发现符号链接子项）");
+                self.status_message = Some(StatusMsg::info(format!(
+                    "已终止迁移 {}（文件夹里包含符号链接，未做任何改动）",
+                    match &kind {
+                        PendingSymlinkKind::Single { name, .. } | PendingSymlinkKind::Group { name, .. } => name.clone(),
+                    }
+                )));
+            }
         }
     }
 
@@ -2503,6 +2572,18 @@ impl DiskForgeApp {
                 self.symlink_done = Some(SymlinkDoneInfo { summary, bat_path });
             }
             Err(e) => {
+                // 文件夹里有符号链接子项：不是失败，弹窗让用户选择继续/终止
+                if let Some(offender) = e.strip_prefix("REPARSE_CONFIRM::") {
+                    let kind = PendingSymlinkKind::Single {
+                        source: request.source,
+                        abs_path: request.abs_path,
+                        name: request.name,
+                        full_path: request.full_path,
+                        is_folder: true,
+                    };
+                    self.pending_reparse_confirm = Some((kind, request.drive, offender.to_string()));
+                    return;
+                }
                 crate::applog::log(&format!("[app] 创建符号链接失败 ({}): {e}", request.name));
                 self.status_message = Some(StatusMsg::error(format!("创建符号链接失败 ({}): {e}", request.name)));
             }

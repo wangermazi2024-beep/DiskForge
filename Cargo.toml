@@ -1,6 +1,6 @@
 [package]
 name = "diskforge"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2024"
 description = "DiskForge — 免费的 Windows NTFS 磁盘空间与文件分析器"
 authors = ["WMS <wumingshifn@gmail.com>"]
