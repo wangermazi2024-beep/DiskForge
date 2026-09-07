@@ -1,40 +1,224 @@
 
 #[cfg(windows)]
-pub fn delete_to_recycle_bin(path: &str) -> Result<(), String> {
+mod recycle_bin {
+    //! 删除到回收站：使用现代 IFileOperation COM 接口（微软官方推荐，取代已过时的
+    //! SHFileOperation）。旧 API 对大文件夹会"进度跑完却静默中止"（0x78=源访问被拒），
+    //! 这里除了检查 HRESULT，还以"源是否真的消失"作为最终成败标准。
+    use std::ffi::c_void;
     use std::os::windows::ffi::OsStrExt;
+    use std::path::Path;
+
+    use windows_sys::core::{GUID, HRESULT, PCWSTR};
+    use windows_sys::Win32::System::Com::{CoCreateInstance, CoInitializeEx, CLSCTX_ALL, COINIT_APARTMENTTHREADED};
     use windows_sys::Win32::UI::Shell::{
-        SHFileOperationW, FOF_ALLOWUNDO, FOF_NOCONFIRMATION, FOF_NOERRORUI,
-        FO_DELETE, SHFILEOPSTRUCTW,
+        FOFX_RECYCLEONDELETE, FOF_NOCONFIRMATION, FOF_NOERRORUI, SHCreateItemFromParsingName,
     };
 
-    if path.is_empty() {
-        return Err("路径为空".to_string());
-    }
-    let mut from: Vec<u16> = std::ffi::OsStr::new(path).encode_wide().collect();
-    from.push(0);
-    from.push(0);
-
-    let mut op = SHFILEOPSTRUCTW {
-        hwnd: std::ptr::null_mut(),
-        wFunc: FO_DELETE,
-        pFrom: from.as_ptr(),
-        pTo: std::ptr::null(),
-        // 不带 FOF_SILENT：文件多时让系统显示自带进度窗口，避免长时间无反应
-        fFlags: (FOF_ALLOWUNDO | FOF_NOCONFIRMATION | FOF_NOERRORUI) as u16,
-        fAnyOperationsAborted: 0,
-        hNameMappings: std::ptr::null_mut(),
-        lpszProgressTitle: std::ptr::null(),
+    /// CLSID_FileOperation（IFileOperation 组件的 COM 类 GUID，公开稳定值；
+    /// windows-sys 0.59 未导出该常量，手写）
+    const CLSID_FILEOPERATION: GUID = GUID {
+        data1: 0x3AD05575,
+        data2: 0x8857,
+        data3: 0x4850,
+        data4: [0x92, 0x77, 0x11, 0xB8, 0x5B, 0xDB, 0x8E, 0x09],
     };
-    let ret = unsafe { SHFileOperationW(&mut op) };
-    crate::applog::log(&format!("[file_ops] 删除到回收站: {path} (ret={ret}, aborted={})", op.fAnyOperationsAborted));
-    if ret != 0 {
-        return Err(format!("删除失败（错误码 0x{ret:X}）"));
+    /// IID_IFileOperation（IFileOperation 接口 GUID，公开稳定值；windows-sys 0.59 未导出，手写）
+    const IID_IFILEOPERATION: GUID = GUID {
+        data1: 0x947AAB5F,
+        data2: 0x0A5C,
+        data3: 0x4C13,
+        data4: [0xB4, 0xD6, 0x4B, 0xF7, 0x83, 0x6F, 0xC9, 0xF8],
+    };
+    /// SHCreateItemFromParsingName 要求的 IID_IShellItem
+    const IID_SHELLITEM: GUID = GUID {
+        data1: 0x43826D1E,
+        data2: 0xE718,
+        data3: 0x42EE,
+        data4: [0xBC, 0x55, 0xA1, 0xE2, 0x61, 0xC3, 0x7B, 0xFE],
+    };
+
+    /// IFileOperation 的手写 COM vtable（windows-sys 只提供 GUID 与自由函数，
+    /// 不含接口方法）。槽位顺序摘自本机 Windows SDK 10.0.26100.0 的
+    /// um/shobjidl_core.h（IUnknown 之后依次为 Advise/Unadvise/SetOperationFlags/...），
+    /// 与微软文档按字母排列的顺序不同——槽位错一位就是未定义行为。
+    // 字段名保持 Windows COM 接口的原生命名（QueryInterface 等），不做 snake_case 转换
+    // ABI 必须是 extern "system"（COM 标准）；用 Rust ABI 会导致调用约定未定义
+    #[allow(non_snake_case)]
+    #[repr(C)]
+    struct IFileOperationVtbl {
+        QueryInterface: unsafe extern "system" fn(*mut c_void, *const windows_sys::core::GUID, *mut *mut c_void) -> HRESULT,
+        AddRef: unsafe extern "system" fn(*mut c_void) -> u32,
+        Release: unsafe extern "system" fn(*mut c_void) -> u32,
+        Advise: unsafe extern "system" fn(*mut c_void, *mut c_void, *mut u32) -> HRESULT,
+        Unadvise: unsafe extern "system" fn(*mut c_void, u32) -> HRESULT,
+        SetOperationFlags: unsafe extern "system" fn(*mut c_void, u32) -> HRESULT,
+        SetProgressMessage: unsafe extern "system" fn(*mut c_void, PCWSTR) -> HRESULT,
+        SetProgressDialog: unsafe extern "system" fn(*mut c_void, *mut c_void) -> HRESULT,
+        SetProperties: unsafe extern "system" fn(*mut c_void, *mut c_void) -> HRESULT,
+        SetOwnerWindow: unsafe extern "system" fn(*mut c_void, *mut c_void) -> HRESULT,
+        ApplyPropertiesToItem: unsafe extern "system" fn(*mut c_void, *mut c_void) -> HRESULT,
+        ApplyPropertiesToItems: unsafe extern "system" fn(*mut c_void, *mut c_void) -> HRESULT,
+        RenameItem: unsafe extern "system" fn(*mut c_void, *mut c_void, PCWSTR, *mut c_void) -> HRESULT,
+        RenameItems: unsafe extern "system" fn(*mut c_void, *mut c_void, PCWSTR) -> HRESULT,
+        MoveItem: unsafe extern "system" fn(*mut c_void, *mut c_void, *mut c_void, PCWSTR, *mut c_void) -> HRESULT,
+        MoveItems: unsafe extern "system" fn(*mut c_void, *mut c_void, *mut c_void, PCWSTR, *mut c_void) -> HRESULT,
+        CopyItem: unsafe extern "system" fn(*mut c_void, *mut c_void, *mut c_void, PCWSTR, *mut c_void) -> HRESULT,
+        CopyItems: unsafe extern "system" fn(*mut c_void, *mut c_void, *mut c_void, PCWSTR, *mut c_void) -> HRESULT,
+        DeleteItem: unsafe extern "system" fn(*mut c_void, *mut c_void, *mut c_void) -> HRESULT,
+        DeleteItems: unsafe extern "system" fn(*mut c_void, *mut c_void) -> HRESULT,
+        NewItem: unsafe extern "system" fn(*mut c_void, *mut c_void, u32, PCWSTR, PCWSTR, *mut c_void) -> HRESULT,
+        PerformOperations: unsafe extern "system" fn(*mut c_void) -> HRESULT,
+        GetAnyOperationsAborted: unsafe extern "system" fn(*mut c_void, *mut i32) -> HRESULT,
     }
-    if op.fAnyOperationsAborted != 0 {
-        return Err("操作被取消".to_string());
+
+    // 字段名保持与 C 头文件一致的 lpVtbl 命名
+    #[allow(non_snake_case)]
+    #[repr(C)]
+    struct IFileOperation {
+        lpVtbl: *const IFileOperationVtbl,
     }
-    Ok(())
+
+    fn wide(path: &str) -> Vec<u16> {
+        std::ffi::OsStr::new(path).encode_wide().chain(std::iter::once(0)).collect()
+    }
+
+    fn check_hr(hr: HRESULT, step: &str) -> Result<(), String> {
+        if hr == 0 {
+            Ok(())
+        } else {
+            Err(format!("{step}失败（HRESULT 0x{hr:08X}）"))
+        }
+    }
+
+    fn perform_delete(op: *mut c_void, vt: &IFileOperationVtbl, path: &str) -> Result<(), String> {
+        // FOFX_RECYCLEONDELETE 是 IFileOperation 明确"删除进回收站"的标志
+        // （Win8+，微软文档明确说明）；FOF_ALLOWUNDO 只对旧 SHFileOperation 有效
+        let flags = FOFX_RECYCLEONDELETE | FOF_NOCONFIRMATION | FOF_NOERRORUI;
+        check_hr(unsafe { (vt.SetOperationFlags)(op, flags) }, "设置操作参数")?;
+
+        let path_w = wide(path);
+        let mut item: *mut c_void = std::ptr::null_mut();
+        // SAFETY: path_w 以 null 结尾，IID_SHELLITEM 与 item 指针均合法
+        let hr = unsafe { SHCreateItemFromParsingName(path_w.as_ptr(), std::ptr::null_mut(), &IID_SHELLITEM, &mut item) };
+        if hr != 0 || item.is_null() {
+            return Err(format!("无法解析路径 {path}（HRESULT 0x{hr:08X}）"));
+        }
+
+        check_hr(unsafe { (vt.DeleteItem)(op, item, std::ptr::null_mut()) }, "加入删除任务")?;
+        // SHCreateItemFromParsingName 返回的 IShellItem 引用计数归调用方，用完必须 Release
+        // （IUnknown 的 Release 固定在 vtable 槽 2）
+        unsafe {
+            let item_vt = *(item as *mut *const c_void);
+            let release = *(item_vt as *const unsafe extern "system" fn(*mut c_void) -> u32).add(2);
+            (release)(item);
+        }
+        check_hr(unsafe { (vt.PerformOperations)(op) }, "执行删除")?;
+
+        let mut aborted: i32 = 0;
+        let _ = unsafe { (vt.GetAnyOperationsAborted)(op, &mut aborted) };
+        // 最终标准：API 说成功但源还在 = 实际没删成（个别文件被占用/访问被拒时
+        // shell 会静默中止或跳过，必须以文件系统的真实状态为准）
+        let still_there = Path::new(path).exists();
+        if aborted == 0 && !still_there {
+            return Ok(());
+        }
+        // 失败时列出具体残留的文件，用户不用再猜卡在哪个条目上
+        let remaining = list_remaining(Path::new(path), 5);
+        let detail = if remaining.is_empty() {
+            String::new()
+        } else {
+            format!(
+                "，残留条目（最多列 5 个）: {}",
+                remaining.join("、")
+            )
+        };
+        if aborted != 0 {
+            // 用户点取消 / 个别文件被占用或访问被拒时，shell 会中止整个操作
+            return Err(format!(
+                "操作被中止（进度框被手动取消，或个别文件被占用/访问被拒导致 shell 放弃）{detail}"
+            ));
+        }
+        return Err(format!(
+            "删除未完成：部分文件被占用或访问被拒，目标仍在原位置{detail}"
+        ));
+    }
+
+    /// 失败诊断：从根路径递归收集仍残留的前 `limit` 个条目（相对路径）。
+    /// 只为写日志，任何 IO 错误都静默跳过；数量到上限即停，避免在大目录上耗时。
+    fn list_remaining(root: &Path, limit: usize) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        let base = root.as_os_str().len();
+        walk(root, root, &mut out, base, limit);
+        return out;
+
+        fn walk(dir: &Path, root: &Path, out: &mut Vec<String>, base_len: usize, limit: usize) {
+            if out.len() >= limit {
+                return;
+            }
+            let Ok(entries) = std::fs::read_dir(dir) else {
+                // 目录本身读不了（权限/占用），把目录自己记为残留
+                if out.len() < limit {
+                    out.push(rel_display(dir, root, base_len));
+                }
+                return;
+            };
+            for e in entries.flatten() {
+                if out.len() >= limit {
+                    return;
+                }
+                let p = e.path();
+                if p.is_dir() {
+                    walk(&p, root, out, base_len, limit);
+                } else {
+                    out.push(rel_display(&p, root, base_len));
+                }
+            }
+        }
+
+        fn rel_display(p: &Path, root: &Path, base_len: usize) -> String {
+            p.to_string_lossy()
+                .get(base_len..)
+                .map(|s| s.trim_start_matches('\\').to_string())
+                .unwrap_or_else(|| p.to_string_lossy().into_owned())
+        }
+    }
+
+    pub fn delete_to_recycle_bin(path: &str) -> Result<(), String> {
+        if path.is_empty() {
+            return Err("路径为空".to_string());
+        }
+        unsafe {
+            // 独立删除线程上的 COM 初始化；已初始化（S_FALSE）也无妨，
+            // 线程退出时由系统回收，不配对 CoUninitialize 是安全的
+            let _ = CoInitializeEx(std::ptr::null(), COINIT_APARTMENTTHREADED as u32);
+
+            let mut op: *mut c_void = std::ptr::null_mut();
+            let hr = CoCreateInstance(
+                &CLSID_FILEOPERATION,
+                std::ptr::null_mut(),
+                CLSCTX_ALL,
+                &IID_IFILEOPERATION,
+                &mut op,
+            );
+            if hr != 0 || op.is_null() {
+                let msg = format!("初始化文件操作组件失败（HRESULT 0x{hr:08X}）");
+                crate::applog::log(&format!("[file_ops] 删除到回收站失败: {path}: {msg}"));
+                return Err(msg);
+            }
+            let vt: &IFileOperationVtbl = &*(*(op as *mut IFileOperation)).lpVtbl;
+            let result = perform_delete(op, vt, path);
+            (vt.Release)(op);
+            match &result {
+                Ok(()) => crate::applog::log(&format!("[file_ops] 删除到回收站完成: {path}")),
+                Err(e) => crate::applog::log(&format!("[file_ops] 删除到回收站失败: {path}: {e}")),
+            }
+            result
+        }
+    }
 }
+
+#[cfg(windows)]
+pub use recycle_bin::delete_to_recycle_bin;
 
 #[cfg(not(windows))]
 pub fn delete_to_recycle_bin(_path: &str) -> Result<(), String> {
@@ -1056,6 +1240,8 @@ pub fn describe_locking_processes(procs: &[LockingProcess]) -> String {
 pub fn delete_to_recycle_bin_with_lock_check(path: &str) -> Result<(), String> {
     // 不做自动重试：大文件夹删除到回收站可能要跑很久，重试会从头再枚举一遍，
     // 几十秒后再次失败反而浪费时间；删除有系统进度窗口，失败由用户自行重试
+    // TODO: 将来可考虑对文件夹失败做"逐项删除降级"（跳过个别被占用的文件，
+    //       其余照常删入回收站），等实际需求明确后再实现
     if let Err(e) = delete_to_recycle_bin(path) {
         return match find_locking_processes(&[path]) {
             Ok(procs) if !procs.is_empty() => Err(format!("{e}；{}", describe_locking_processes(&procs))),

@@ -1,5 +1,5 @@
 
-pub use diskforge::{about, applog, categorize, dedup, disk_info, export, file_ops, format, fs_attrs, model, scan, search_index, theme};
+pub use diskforge::{about, applog, categorize, crash_logger, dedup, disk_info, export, file_ops, format, fs_attrs, model, scan, search_index, theme};
 #[cfg(windows)]
 pub use diskforge::mft_scan;
 
@@ -85,6 +85,7 @@ fn install_panic_logger() {
 fn main() -> eframe::Result<()> {
     applog::init();
     install_panic_logger();
+    crash_logger::install();
     const WINDOW_SIZE: [f32; 2] = [1200.0, 750.0];
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()

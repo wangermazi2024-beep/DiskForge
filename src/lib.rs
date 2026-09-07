@@ -2,6 +2,7 @@
 pub mod about;
 pub mod applog;
 pub mod categorize;
+pub mod crash_logger;
 pub mod dedup;
 pub mod dir_enum;
 pub mod disk_info;
