@@ -165,58 +165,63 @@ pub fn delete_to_recycle_bin(path: &str) -> Result<(), String> {
 
     // SAFETY: COM 调用序列按微软文档顺序执行；sink 对象由 Advise 持有引用，
     // 本地 sink_pc 在 Unadvise 之前保持存活。
-    let result = unsafe {
-        let op: IFileOperation = match CoCreateInstance(&FileOperation, None, CLSCTX_ALL) {
-            Ok(op) => op,
-            Err(e) => return Err(map_err_msg("初始化文件操作组件", e)),
-        };
-        if let Err(e) = op.SetOperationFlags(FOFX_RECYCLEONDELETE | FOF_NOCONFIRMATION | FOF_NOERRORUI) {
-            return Err(map_err_msg("设置操作参数", e));
-        }
-        let failures = Arc::new(Mutex::new(Vec::new()));
-        let sink_pc: IFileOperationProgressSink = DeleteProgressSink { failures: failures.clone() }.into();
-        let cookie = match op.Advise(&sink_pc) {
-            Ok(c) => c,
-            Err(e) => return Err(map_err_msg("注册进度回调", e)),
-        };
-        let run = (|| -> Result<(), String> {
-            let item: IShellItem = SHCreateItemFromParsingName(&HSTRING::from(path), None)
-                .map_err(|e| format!("无法解析路径 {path}（HRESULT 0x{:08X}，{e}）", e.code().0 as u32))?;
-            op.DeleteItem(Some(&item), None).map_err(|e| map_err_msg("加入删除任务", e))?;
-            op.PerformOperations().map_err(|e| map_err_msg("执行删除", e))?;
-            Ok(())
-        })();
-        let _ = op.Unadvise(cookie);
-        run?;
-        drop(sink_pc);
+    // 整个流程包进闭包：内部任何早期 return（组件初始化失败、PerformOperations
+    // 报错等）都统一落进 result 再走 logged()——之前 `run?` 直接从函数返回，
+    // 这类失败一行日志都不会写，用户只能看到"没有任何日志"
+    let result = (|| -> Result<(), String> {
+        unsafe {
+            let op: IFileOperation = match CoCreateInstance(&FileOperation, None, CLSCTX_ALL) {
+                Ok(op) => op,
+                Err(e) => return Err(map_err_msg("初始化文件操作组件", e)),
+            };
+            if let Err(e) = op.SetOperationFlags(FOFX_RECYCLEONDELETE | FOF_NOCONFIRMATION | FOF_NOERRORUI) {
+                return Err(map_err_msg("设置操作参数", e));
+            }
+            let failures = Arc::new(Mutex::new(Vec::new()));
+            let sink_pc: IFileOperationProgressSink = DeleteProgressSink { failures: failures.clone() }.into();
+            let cookie = match op.Advise(&sink_pc) {
+                Ok(c) => c,
+                Err(e) => return Err(map_err_msg("注册进度回调", e)),
+            };
+            let run = (|| -> Result<(), String> {
+                let item: IShellItem = SHCreateItemFromParsingName(&HSTRING::from(path), None)
+                    .map_err(|e| format!("无法解析路径 {path}（HRESULT 0x{:08X}，{e}）", e.code().0 as u32))?;
+                op.DeleteItem(Some(&item), None).map_err(|e| map_err_msg("加入删除任务", e))?;
+                op.PerformOperations().map_err(|e| map_err_msg("执行删除", e))?;
+                Ok(())
+            })();
+            let _ = op.Unadvise(cookie);
+            run?;
+            drop(sink_pc);
 
-        // 逐项失败明细（PostDeleteItem 回调收集）
-        let failures = failures.lock().map(|mut l| std::mem::take(&mut *l)).unwrap_or_default();
-        let aborted = op.GetAnyOperationsAborted().is_ok_and(|b| b.as_bool());
-        let still_there = Path::new(path).exists();
-        if aborted || !failures.is_empty() || still_there {
-            // 无论哪条线索指出失败，都补充"还剩哪些文件"帮助定位
-            let remaining = list_remaining(Path::new(path), 5);
-            let mut msg = String::new();
-            if !failures.is_empty() {
-                msg.push_str(&format!("以下子项删除失败: {}；", failures.join("、")));
-            }
-            if aborted && failures.is_empty() {
-                msg.push_str("操作被中止（进度框被手动取消，或个别子项被占用/访问被拒导致 shell 放弃）；");
-            }
-            if still_there {
-                msg.push_str("目标仍在原位置");
-                if !remaining.is_empty() {
-                    msg.push_str(&format!("，残留条目（最多列 5 个）: {}", remaining.join("、")));
+            // 逐项失败明细（PostDeleteItem 回调收集）
+            let failures = failures.lock().map(|mut l| std::mem::take(&mut *l)).unwrap_or_default();
+            let aborted = op.GetAnyOperationsAborted().is_ok_and(|b| b.as_bool());
+            let still_there = Path::new(path).exists();
+            if aborted || !failures.is_empty() || still_there {
+                // 无论哪条线索指出失败，都补充"还剩哪些文件"帮助定位
+                let remaining = list_remaining(Path::new(path), 5);
+                let mut msg = String::new();
+                if !failures.is_empty() {
+                    msg.push_str(&format!("以下子项删除失败: {}；", failures.join("、")));
                 }
+                if aborted && failures.is_empty() {
+                    msg.push_str("操作被中止（进度框被手动取消，或个别子项被占用/访问被拒导致 shell 放弃）；");
+                }
+                if still_there {
+                    msg.push_str("目标仍在原位置");
+                    if !remaining.is_empty() {
+                        msg.push_str(&format!("，残留条目（最多列 5 个）: {}", remaining.join("、")));
+                    }
+                }
+                while msg.ends_with('；') {
+                    msg.pop();
+                }
+                return Err(msg);
             }
-            while msg.ends_with('；') {
-                msg.pop();
-            }
-            return Err(msg);
+            Ok(())
         }
-        Ok(())
-    };
+    })();
     logged(&result);
     result
 }
