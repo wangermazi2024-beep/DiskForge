@@ -2089,7 +2089,7 @@ impl DiskForgeApp {
         let full_path = pending.full_path.clone();
         let (tx, rx) = mpsc::channel();
         std::thread::spawn(move || {
-            let _ = tx.send(crate::file_ops::delete_to_recycle_bin_with_retry(&full_path));
+            let _ = tx.send(crate::file_ops::delete_to_recycle_bin_with_lock_check(&full_path));
         });
         self.delete_rx = Some((pending, rx));
     }

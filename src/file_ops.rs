@@ -3,7 +3,7 @@
 pub fn delete_to_recycle_bin(path: &str) -> Result<(), String> {
     use std::os::windows::ffi::OsStrExt;
     use windows_sys::Win32::UI::Shell::{
-        SHFileOperationW, FOF_ALLOWUNDO, FOF_NOCONFIRMATION, FOF_NOERRORUI, FOF_SILENT,
+        SHFileOperationW, FOF_ALLOWUNDO, FOF_NOCONFIRMATION, FOF_NOERRORUI,
         FO_DELETE, SHFILEOPSTRUCTW,
     };
 
@@ -19,7 +19,8 @@ pub fn delete_to_recycle_bin(path: &str) -> Result<(), String> {
         wFunc: FO_DELETE,
         pFrom: from.as_ptr(),
         pTo: std::ptr::null(),
-        fFlags: (FOF_ALLOWUNDO | FOF_NOCONFIRMATION | FOF_NOERRORUI | FOF_SILENT) as u16,
+        // 不带 FOF_SILENT：文件多时让系统显示自带进度窗口，避免长时间无反应
+        fFlags: (FOF_ALLOWUNDO | FOF_NOCONFIRMATION | FOF_NOERRORUI) as u16,
         fAnyOperationsAborted: 0,
         hNameMappings: std::ptr::null_mut(),
         lpszProgressTitle: std::ptr::null(),
@@ -1052,26 +1053,16 @@ pub fn describe_locking_processes(procs: &[LockingProcess]) -> String {
     format!("被 {} 占用", names.join("、"))
 }
 
-pub fn delete_to_recycle_bin_with_retry(path: &str) -> Result<(), String> {
-    const RETRIES: u32 = 3;
-    let mut last_err = String::new();
-    for attempt in 0..=RETRIES {
-        match delete_to_recycle_bin(path) {
-            Ok(()) => return Ok(()),
-            Err(e) => {
-                last_err = e;
-                if attempt < RETRIES {
-                    std::thread::sleep(std::time::Duration::from_millis(300 * (attempt as u64 + 1)));
-                }
-            }
-        }
+pub fn delete_to_recycle_bin_with_lock_check(path: &str) -> Result<(), String> {
+    // 不做自动重试：大文件夹删除到回收站可能要跑很久，重试会从头再枚举一遍，
+    // 几十秒后再次失败反而浪费时间；删除有系统进度窗口，失败由用户自行重试
+    if let Err(e) = delete_to_recycle_bin(path) {
+        return match find_locking_processes(&[path]) {
+            Ok(procs) if !procs.is_empty() => Err(format!("{e}；{}", describe_locking_processes(&procs))),
+            _ => Err(e),
+        };
     }
-    match find_locking_processes(&[path]) {
-        Ok(procs) if !procs.is_empty() => {
-            Err(format!("{last_err}；{}", describe_locking_processes(&procs)))
-        }
-        _ => Err(last_err),
-    }
+    Ok(())
 }
 
 
