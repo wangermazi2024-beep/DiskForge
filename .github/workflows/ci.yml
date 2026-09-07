@@ -1,0 +1,45 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # Windows 是唯一的目标平台：构建 + clippy -D warnings + 测试 + 产物上传。
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-gnu
+          components: clippy
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Type check (all targets)
+        run: cargo check --all-targets --target x86_64-pc-windows-gnu
+
+      # 万星标准：clippy 零警告是硬性门槛，新增警告直接红。
+      - name: Clippy (deny warnings)
+        run: cargo clippy --all-targets --target x86_64-pc-windows-gnu -- -D warnings
+
+      # 纯逻辑测试不依赖 GUI/Win32，在 CI 里全量跑。
+      - name: Tests
+        run: cargo test --no-default-features
+
+      - name: Release build
+        run: cargo build --release --target x86_64-pc-windows-gnu
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: DiskForge-windows-x64
+          path: target/x86_64-pc-windows-gnu/release/DiskForge.exe

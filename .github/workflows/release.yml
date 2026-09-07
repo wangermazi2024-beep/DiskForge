@@ -1,0 +1,85 @@
+name: Release
+
+# 一键编译发布到 GitHub Releases，两种触发方式任选其一：
+#  1. 手动：GitHub 仓库页 → Actions → Release → Run workflow（一键发布）
+#  2. 自动：推送一个 v 开头的标签（git tag v0.1 && git push origin v0.1）
+#
+# 发布内容：Release 构建（含图标/版本资源的单文件 DiskForge.exe）打包成
+# zip，附 SHA256 校验值，发布到仓库的 Releases 页面。重复发布同一个标签
+# 时只覆盖附件（--clobber），不会重复建 Release。
+
+on:
+  workflow_dispatch:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  release:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      # Windows 原生工具链（MSVC）构建；build.rs 会用 rc.exe 把图标和
+      # 版本/版权资源写进 exe，资源管理器里看到的文件图标与属性页信息
+      # 都在这一步生成。
+      - name: Build release exe
+        run: cargo build --release
+
+      - name: Determine release tag
+        id: ver
+        shell: bash
+        run: |
+          if [[ "$GITHUB_REF_TYPE" == "tag" ]]; then
+            TAG="$GITHUB_REF_NAME"
+          else
+            CARGO_VERSION=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1)
+            TAG="v$CARGO_VERSION"
+          fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+
+      - name: Package
+        shell: bash
+        env:
+          TAG: ${{ steps.ver.outputs.tag }}
+        run: |
+          STAGE="DiskForge-${TAG}-windows-x64"
+          mkdir "$STAGE"
+          cp target/release/DiskForge.exe "$STAGE/"
+          cp README.md LICENSE "$STAGE/"
+          zip -r "$STAGE.zip" "$STAGE"
+          sha256sum "$STAGE.zip" > "$STAGE.zip.sha256"
+
+      - name: Publish to GitHub Releases
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.ver.outputs.tag }}
+          ZIP: DiskForge-${{ steps.ver.outputs.tag }}-windows-x64.zip
+        run: |
+          cat > release_notes.md <<'EOF'
+          免费、单文件、免安装的 Windows 磁盘空间分析器。
+
+          - 下载下方 zip，解压后双击 `DiskForge.exe` 即可运行（无需安装）
+          - 想要极速扫描请右键选择"以管理员身份运行"
+          - 更新内容见 CHANGELOG.md
+          EOF
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" "$ZIP" "$ZIP.sha256" --clobber
+          else
+            gh release create "$TAG" "$ZIP" "$ZIP.sha256" \
+              --target "$GITHUB_SHA" \
+              --title "DiskForge $TAG" \
+              --notes-file release_notes.md
+          fi

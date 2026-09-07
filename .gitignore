@@ -1,0 +1,22 @@
+# 编译产物
+/target/
+
+# 运行时生成的日志/导出产物（不属于源码，不应该进版本库）
+diskforge_log.txt
+diskforge_export_*.csv
+
+# 常见编辑器/IDE 产物
+.vscode/
+.idea/
+*.swp
+
+# Windows 系统文件
+Thumbs.db
+desktop.ini
+
+# 编译后的可执行文件和发布包
+*.exe
+*.zip
+disklens_log.txt
+Cargo.lock
+*.py

@@ -1,0 +1,77 @@
+[package]
+name = "diskforge"
+version = "0.1.0"
+edition = "2024"
+description = "DiskForge — 免费的 Windows NTFS 磁盘空间与文件分析器"
+authors = ["WMS <wumingshifn@gmail.com>"]
+license = "MIT"
+
+[lib]
+name = "diskforge"
+
+[features]
+default = ["gui"]
+gui = ["dep:eframe", "dep:egui_extras", "dep:rfd", "dep:image"]
+
+[build-dependencies]
+# exe 内嵌资源（图标 + 版本/版权信息）：在 Windows 上编译时用 rc.exe/windres
+# 写入资源；在无法使用资源编译器的环境（如 Linux 交叉检查）里 build.rs 会
+# 降级为警告并继续编译，不会阻塞 cargo check/clippy/test。
+winresource = "0.1"
+
+[dependencies]
+egui = "0.35"
+egui_extras = { version = "0.35", optional = true }
+eframe = { version = "0.35", default-features = false, features = ["glow", "default_fonts"], optional = true }
+# 内置图片资源（应用图标 / 赞助二维码 PNG）的解码，供 egui 纹理与窗口图标用。
+image = { version = "0.25", optional = true, default-features = false, features = ["png"] }
+dashmap = "6"
+rfd = { version = "0.17", optional = true }
+# 重复文件内容比对用：BLAKE3 做局部哈希预筛和全文件最终确认（SIMD 加速，
+# 非加密哈希里数一数二快，fddf/fclones/yadf 这些主流开源去重工具的常见选择，
+# 见 dedup.rs 顶部注释——原来最终确认单独用较慢的 SHA-256 是为了能被系统
+# 自带工具核对，但实测在高重复率数据集上这个选择直接拖慢了几倍总耗时，
+# 权衡下改成全程用 BLAKE3，需要核对某个具体文件时用 BLAKE3 官方的 `b3sum`
+# 工具或者手动抽查即可，不需要为了小概率用得上的场景牺牲默认速度）。
+blake3 = "1"
+# 统一日志：log 是 Rust 生态里用得最多的日志门面，见 applog.rs 顶部注释。
+log = "0.4"
+# 日志时间戳用；标准库没有日历换算，手搓容易出 bug，chrono 是这个生态里
+# 最常用、最经过考验的时间库。
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+# 搜索框的正则表达式模式用：Rust 生态标准正则库，成熟稳定、支持大小写不敏感
+# 匹配（`RegexBuilder::case_insensitive`），够用，不需要更复杂的模糊匹配算法。
+regex = "1"
+# 名字索引的 SIMD 子串搜索用（search_index.rs）：memchr 是 ripgrep 的核心
+# 底层库，`memmem::Finder` 在连续内存上做子串搜索的吞吐量以 GB/s 计。
+# regex 本来就传递依赖它，这里显式声明只是"直接 use"所要求的正规手续，
+# 不会增加任何编译产物。
+memchr = "2"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_Storage_FileSystem",
+    "Win32_System_IO",
+    "Win32_System_Ioctl",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Registry",
+    "Win32_System_Time",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_System_Threading",
+    "Win32_UI_Shell",
+    # 检测"文件/文件夹被哪个进程占用"用的是 Windows 官方的 Restart Manager
+    # API（资源管理器"文件正在使用"弹窗、Windows Installer 更新前检测占用，
+    # 用的都是同一套 API），见 file_ops.rs 顶部注释。
+    "Win32_System_RestartManager",
+    # "结束进程"用 Win32_System_Threading 里的 OpenProcess/TerminateProcess
+    # （已经在下面列了）；"停止服务"需要单独的服务控制管理器 API。
+    "Win32_System_Services",
+    "Win32_UI_WindowsAndMessaging",
+] }
+
+[[bin]]
+name = "DiskForge"
+path = "src/main.rs"
+required-features = ["gui"]
