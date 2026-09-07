@@ -52,12 +52,12 @@ fn write_line(msg: &str) {
             let next = LOG_BYTES_WRITTEN.fetch_add(line.len() as u64 + 1, Ordering::Relaxed)
                 + line.len() as u64
                 + 1;
-            if next >= MAX_LOG_BYTES {
-                if let Ok(new_f) = OpenOptions::new().create(true).write(true).truncate(true).open(log_path()) {
-                    *guard = Some(new_f);
-                    LOG_BYTES_WRITTEN.store(0, Ordering::Relaxed);
-                    eprintln!("[applog] 日志已超过 5MB，重新开始（运行时轮转）");
-                }
+            if next >= MAX_LOG_BYTES
+                && let Ok(new_f) = OpenOptions::new().create(true).write(true).truncate(true).open(log_path())
+            {
+                *guard = Some(new_f);
+                LOG_BYTES_WRITTEN.store(0, Ordering::Relaxed);
+                eprintln!("[applog] 日志已超过 5MB，重新开始（运行时轮转）");
             }
             if let Some(f) = guard.as_mut() {
                 let _ = writeln!(f, "{line}");

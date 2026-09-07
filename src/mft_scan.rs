@@ -673,15 +673,14 @@ fn process_record(rec: &mut [u8], current_record: u64, ctx: &mut NtfsContext, by
                     }
                 }
             }
-        } else if attr_type == ATTR_REPARSE_POINT && !non_resident {
-            if off + 22 <= rec.len() {
-                let value_off = u16::from_le_bytes([rec[off + 20], rec[off + 21]]) as usize;
-                let content = off + value_off;
-                if content + 4 <= rec.len() {
-                    base_entry.reparse_tag = u32::from_le_bytes(rec[content..content + 4].try_into().unwrap());
-                    if base_entry.reparse_tag == IO_REPARSE_TAG_WOF {
-                        base_entry.attributes |= FILE_ATTRIBUTE_COMPRESSED;
-                    }
+        } else if attr_type == ATTR_REPARSE_POINT && !non_resident
+            && off + 22 <= rec.len() {
+            let value_off = u16::from_le_bytes([rec[off + 20], rec[off + 21]]) as usize;
+            let content = off + value_off;
+            if content + 4 <= rec.len() {
+                base_entry.reparse_tag = u32::from_le_bytes(rec[content..content + 4].try_into().unwrap());
+                if base_entry.reparse_tag == IO_REPARSE_TAG_WOF {
+                    base_entry.attributes |= FILE_ATTRIBUTE_COMPRESSED;
                 }
             }
         }
