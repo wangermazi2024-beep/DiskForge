@@ -147,9 +147,16 @@ pub fn delete_to_recycle_bin(path: &str) -> Result<(), String> {
     if path.is_empty() {
         return Err("路径为空".to_string());
     }
-    let logged = |result: &Result<(), String>| match result {
-        Ok(()) => crate::applog::log(&format!("[file_ops] 删除到回收站完成: {path}")),
-        Err(e) => crate::applog::log(&format!("[file_ops] 删除到回收站失败: {path}: {e}")),
+    // 开始就记一条日志并开始计时：大文件夹删除可能要跑很久，
+    // 只有结束才有日志会让人以为程序没开始删
+    let start = std::time::Instant::now();
+    crate::applog::log(&format!("[file_ops] 开始删除到回收站: {path}"));
+    let logged = |result: &Result<(), String>| {
+        let secs = start.elapsed().as_secs_f64();
+        match result {
+            Ok(()) => crate::applog::log(&format!("[file_ops] 删除到回收站完成: {path}（耗时 {secs:.1}s）")),
+            Err(e) => crate::applog::log(&format!("[file_ops] 删除到回收站失败: {path}: {e}（耗时 {secs:.1}s）")),
+        }
     };
 
     // 独立删除线程上的 COM 初始化；已初始化（S_FALSE）也无妨，
@@ -1243,7 +1250,13 @@ pub fn delete_to_recycle_bin_with_lock_check(path: &str) -> Result<(), String> {
     //       其余照常删入回收站），等实际需求明确后再实现
     if let Err(e) = delete_to_recycle_bin(path) {
         return match find_locking_processes(&[path]) {
-            Ok(procs) if !procs.is_empty() => Err(format!("{e}；{}", describe_locking_processes(&procs))),
+            Ok(procs) if !procs.is_empty() => {
+                let detail = describe_locking_processes(&procs);
+                // 占用进程分析单独记日志：上面的失败日志在 lock check 之前落盘，
+                // 不补这条的话日志文件里就看不到是哪个进程占用
+                crate::applog::log(&format!("[file_ops] 删除失败占用分析: {path}: {detail}"));
+                Err(format!("{e}；{detail}"))
+            }
             _ => Err(e),
         };
     }

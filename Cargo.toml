@@ -1,6 +1,6 @@
 ﻿[package]
 name = "diskforge"
-version = "0.1.5"
+version = "0.1.6"
 edition = "2024"
 description = "DiskForge — 免费的 Windows NTFS 磁盘空间与文件分析器"
 authors = ["WMS <wumingshifn@gmail.com>"]
@@ -71,6 +71,8 @@ windows-sys = { version = "0.59", features = [
     "Win32_Security",
     "Win32_Security_Authorization",
     "Win32_System_Threading",
+    # 禁用控制台快速编辑模式（防止鼠标误选卡住程序）用 Console API。
+    "Win32_System_Console",
     "Win32_UI_Shell",
     # 检测"文件/文件夹被哪个进程占用"用的是 Windows 官方的 Restart Manager
     # API（资源管理器"文件正在使用"弹窗、Windows Installer 更新前检测占用，

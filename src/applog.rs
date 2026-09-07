@@ -75,7 +75,33 @@ pub fn log_path() -> PathBuf {
         })
 }
 
+/// 禁用控制台"快速编辑"（QuickEdit）模式：Windows 控制台默认开启该模式，
+/// 鼠标在控制台里一点一划就进入文本选择状态，此时所有向控制台的输出都被
+/// 阻塞，整个程序跟着卡死（按 Esc/回车才恢复）。本程序控制台只是诊断输出，
+/// 不值得为误触选择卡住 GUI，启动时直接关掉。
+/// 注意：ENABLE_EXTENDED_FLAGS 必须与 QUICK_EDIT 位一起设置才生效（MSDN 要求）。
+#[cfg(windows)]
+fn disable_console_quickedit() {
+    use windows_sys::Win32::System::Console::{
+        GetConsoleMode, GetStdHandle, SetConsoleMode, ENABLE_EXTENDED_FLAGS, ENABLE_QUICK_EDIT_MODE,
+        STD_INPUT_HANDLE,
+    };
+    unsafe {
+        let stdin = GetStdHandle(STD_INPUT_HANDLE);
+        let mut mode: u32 = 0;
+        // 没有控制台（GUI 子系统启动/输出重定向）时 GetConsoleMode 返回 0，自然跳过
+        if !stdin.is_null() && GetConsoleMode(stdin, &mut mode) != 0 {
+            let new_mode = (mode & !ENABLE_QUICK_EDIT_MODE) | ENABLE_EXTENDED_FLAGS;
+            if SetConsoleMode(stdin, new_mode) != 0 && mode & ENABLE_QUICK_EDIT_MODE != 0 {
+                eprintln!("[applog] 已禁用控制台快速编辑模式（防止鼠标误选卡住程序）");
+            }
+        }
+    }
+}
+
 pub fn init() {
+    #[cfg(windows)]
+    disable_console_quickedit();
     let path = log_path();
     let existing_len = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
     let truncate = existing_len >= MAX_LOG_BYTES;
