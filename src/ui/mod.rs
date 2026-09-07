@@ -19,6 +19,7 @@ pub enum TreeAction {
     RequestCheckLockGroup { abs_path: NodePath, name: String },
     RequestCreateSymlink { abs_path: NodePath, name: String, full_path: String, is_folder: bool },
     RequestCreateSymlinkGroup { abs_path: NodePath, name: String },
+    RequestResolveSymlink { full_path: String, name: String },
     RequestRescan(usize),
     RequestRemovePartition(usize),
     RequestExtensionBreakdown(usize),

@@ -806,6 +806,20 @@ fn context_menu(
         crate::file_ops::open_properties(full_path);
         ui.close();
     }
+    let resolve_btn = egui::Button::new("🎯 定位真实路径");
+    let resolve_resp = ui.add_enabled(is_reparse, resolve_btn);
+    let resolve_resp = if is_reparse {
+        resolve_resp.on_hover_text("解析这个符号链接/junction 指向的真实位置，并在资源管理器里定位它")
+    } else {
+        resolve_resp.on_disabled_hover_text("只有符号链接/junction/挂载点才有\"真实路径\"，普通文件没有")
+    };
+    if resolve_resp.clicked() {
+        action_request.set(Some(TreeAction::RequestResolveSymlink {
+            name: name.to_string(),
+            full_path: full_path.to_string(),
+        }));
+        ui.close();
+    }
     if ui.button("🔍 检测占用").clicked() {
         action_request.set(Some(TreeAction::RequestCheckLock {
             abs_path: abs_path.clone(),

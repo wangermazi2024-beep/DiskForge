@@ -4,6 +4,7 @@
 # 运行时生成的日志/导出产物（不属于源码，不应该进版本库）
 diskforge_log.txt
 diskforge_export_*.csv
+check_output.txt
 
 # 常见编辑器/IDE 产物
 .vscode/

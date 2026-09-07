@@ -128,6 +128,57 @@ pub fn create_symlink(_link_path: &str, _target_path: &str, _is_dir: bool) -> Re
     Err("仅支持 Windows".to_string())
 }
 
+/// 把原文件/文件夹在同目录内重命名成一个几乎不可能重复的名字：
+/// `原名_名字哈希8位_毫秒时间戳`（哈希是文件名的 FNV-1a 32 位十六进制）。
+/// 改名后原路径就空出来了，既满足创建符号链接"源必须不存在"的要求，
+/// 又保留了一份原件——万一创建符号链接失败，把它改回原名即可完全还原，
+/// 不会出现"文件进了回收站却因权限/特殊目录无法还原"的不可挽回局面。
+fn quarantine_rename(path: &str) -> Result<std::path::PathBuf, String> {
+    let p = Path::new(path);
+    let file_name = p
+        .file_name()
+        .ok_or_else(|| format!("无法解析文件名: {path}"))?
+        .to_string_lossy()
+        .to_string();
+    let parent = p.parent().ok_or_else(|| format!("无法解析上级目录: {path}"))?;
+    let mut hash: u32 = 0x811C_9DC5;
+    for b in file_name.as_bytes() {
+        hash ^= *b as u32;
+        hash = hash.wrapping_mul(0x0100_0193);
+    }
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    let mut last_err: Option<std::io::Error> = None;
+    for attempt in 0..8u32 {
+        // 尝试 0 用纯时间戳，之后追加序号，保证即使同一毫秒多次操作也不重名
+        let candidate_name = if attempt == 0 {
+            format!("{file_name}_{hash:08x}_{ts}")
+        } else {
+            format!("{file_name}_{hash:08x}_{ts}_{attempt}")
+        };
+        let candidate = parent.join(&candidate_name);
+        if candidate.exists() {
+            continue;
+        }
+        match std::fs::rename(p, &candidate) {
+            Ok(()) => {
+                crate::applog::log(&format!("[file_ops] 已把原文件改名挪开: {path} -> {}", candidate.display()));
+                return Ok(candidate);
+            }
+            Err(e) if matches!(e.raw_os_error(), Some(32) | Some(33)) => {
+                // 共享冲突：文件正被占用，短暂等待后重试
+                last_err = Some(e);
+                std::thread::sleep(std::time::Duration::from_millis(400));
+            }
+            Err(e) => return Err(e.to_string()),
+        }
+    }
+    let e = last_err.map(|e| e.to_string()).unwrap_or_else(|| "重试次数用尽".to_string());
+    Err(e)
+}
+
 pub fn replace_with_symlink(path: &str, target: &str, is_dir: bool, verify_content: bool) -> Result<(), String> {
     if verify_content && !is_dir && !crate::dedup::files_identical(path, target) {
         let msg = format!(
@@ -136,17 +187,337 @@ pub fn replace_with_symlink(path: &str, target: &str, is_dir: bool, verify_conte
         crate::applog::log(&format!("[file_ops] 替换符号链接前复查失败: {msg}"));
         return Err(msg);
     }
-    delete_to_recycle_bin_with_retry(path)?;
+    // 第一步：先把原文件改名"挪开"（不是删除！），此时任何数据都没有丢失
+    let quarantined = match quarantine_rename(path) {
+        Ok(q) => q,
+        Err(e) => {
+            let hint = match find_locking_processes(&[path]) {
+                Ok(procs) if !procs.is_empty() => format!("；{}", describe_locking_processes(&procs)),
+                _ => String::new(),
+            };
+            let msg = format!("无法把原文件改名挪开（未做任何改动，原文件完好无损）: {e}{hint}");
+            crate::applog::log(&format!("[file_ops] 替换符号链接中止: {msg}"));
+            return Err(msg);
+        }
+    };
+    // 第二步：创建符号链接；一旦失败立刻把原件改回原名，全程零损失
     if let Err(e) = create_symlink(path, target, is_dir) {
-        let msg = format!("原文件已删除（在回收站里，可以找回），但创建符号链接失败，真实数据在 {target}，请手动处理: {e}");
-        crate::applog::log(&format!("[file_ops] {msg}"));
-        return Err(msg);
+        return match std::fs::rename(&quarantined, path) {
+            Ok(()) => {
+                let msg = format!("创建符号链接失败，已自动把原文件改回原位，没有造成任何丢失: {e}");
+                crate::applog::log(&format!("[file_ops] {msg}"));
+                Err(msg)
+            }
+            Err(re) => {
+                let msg = format!(
+                    "创建符号链接失败，且自动还原也失败了！原文件被安全地改名放在: {}，请手动把它改回「{path}」。创建失败原因: {e}；还原失败原因: {re}",
+                    quarantined.display(),
+                );
+                crate::applog::log(&format!("[file_ops] {msg}"));
+                Err(msg)
+            }
+        };
+    }
+    // 第三步：创建成功，删掉改名后的那份原件（真身已复制/校验存放在 target）
+    let cleanup = if is_dir {
+        std::fs::remove_dir_all(&quarantined)
+    } else {
+        std::fs::remove_file(&quarantined)
+    };
+    if let Err(e) = cleanup {
+        crate::applog::log(&format!(
+            "[file_ops] 符号链接已创建成功，但清理改名后的原文件失败（不影响使用，可稍后手动删除）: {}: {e}",
+            quarantined.display(),
+        ));
+    }
+    // 第四步：把这条符号链接记入还原记录，并确保目标目录下有一键还原脚本
+    if let Err(e) = record_symlink_for_restore(path, target, is_dir) {
+        crate::applog::log(&format!("[file_ops] 写入符号链接还原记录失败（不影响已创建的符号链接）: {e}"));
     }
     Ok(())
 }
 
 pub fn diskforge_base_dir(drive_letter: char) -> String {
     format!("{}:\\DiskForge", drive_letter.to_ascii_uppercase())
+}
+
+// ---------------------------------------------------------------------------
+// 符号链接还原记录 + 一键还原脚本
+//
+// 背景：把某些软件的核心文件（例如 msedge.dll）迁移成符号链接后，个别软件会
+// 因为不兼容符号链接而运行不正常。为了给用户"反悔/拯救"的机会：
+//   1. 每次成功创建符号链接，都把 (符号链接路径, 真实数据路径) 追加写入
+//      目标分区的 DiskForge 目录下的 symlink_records.csv；
+//   2. 首次记录时自动生成两个不需要任何额外环境的还原脚本：
+//      - DiskForge还原符号链接.bat：双击即可启动（内部只是调用 PowerShell）
+//      - restore_symlinks.ps1：按 CSV 记录逐条还原（删链接 -> 把真实数据复制回原位）
+// ---------------------------------------------------------------------------
+
+const RESTORE_BAT_NAME: &str = "DiskForge还原符号链接.bat";
+const RESTORE_PS1_NAME: &str = "restore_symlinks.ps1";
+const RESTORE_CSV_NAME: &str = "symlink_records.csv";
+
+static RESTORE_RECORD_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// 从符号链接目标路径推导 DiskForge 根目录（所有目标都存放在 X:\DiskForge 下）
+fn base_dir_from_target(target: &str) -> Option<String> {
+    let mut it = target.splitn(3, '\\');
+    let drive = it.next()?;
+    let root = it.next()?;
+    if root.eq_ignore_ascii_case("DiskForge") {
+        Some(format!("{drive}\\{root}"))
+    } else {
+        None
+    }
+}
+
+fn csv_field(s: &str) -> String {
+    format!("\"{}\"", s.replace('"', "\"\""))
+}
+
+fn csv_line(fields: &[&str]) -> String {
+    let mut line = fields.iter().map(|f| csv_field(f)).collect::<Vec<_>>().join(",");
+    line.push_str("\r\n");
+    line
+}
+
+const RESTORE_BAT_CONTENT: &str = r#"@echo off
+rem =====================================================
+rem  DiskForge - one-click symlink restore launcher
+rem  Double-click this file to restore the symlinks that
+rem  were created by DiskForge. It simply runs the
+rem  PowerShell restore script in the same folder.
+rem =====================================================
+powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0restore_symlinks.ps1"
+"#;
+
+const RESTORE_PS1_CONTENT: &str = r##"# ============================================================
+#  DiskForge 一键还原符号链接脚本（由 DiskForge 自动生成）
+#  用法：双击同目录下的 DiskForge还原符号链接.bat 即可启动
+#  作用：把 DiskForge 创建的符号链接还原成真实文件/文件夹
+#        （删除链接 -> 把 DiskForge 里存档的真实数据复制回原位）
+#  说明：还原时默认保留 DiskForge 里的存档副本；确认相关软件
+#        一切正常后，可以自行删除整个 DiskForge 目录。
+# ============================================================
+
+$ErrorActionPreference = 'Stop'
+$csvPath = Join-Path $PSScriptRoot 'symlink_records.csv'
+
+Write-Host ''
+Write-Host 'DiskForge 符号链接还原工具' -ForegroundColor Cyan
+Write-Host '=========================='
+Write-Host '本脚本会把 DiskForge 创建的符号链接还原成真实文件/文件夹。'
+
+if (-not (Test-Path -LiteralPath $csvPath)) {
+    Write-Host ''
+    Write-Host "没有找到符号链接创建记录：$csvPath" -ForegroundColor Yellow
+    Write-Host '可能还没有用 DiskForge 创建过符号链接。'
+    Read-Host '按回车键退出' | Out-Null
+    exit 1
+}
+
+$records = @(Import-Csv -LiteralPath $csvPath)
+if ($records.Count -eq 0) {
+    Write-Host '记录文件是空的，没有需要还原的内容。'
+    Read-Host '按回车键退出' | Out-Null
+    exit
+}
+
+Write-Host ''
+Write-Host "共找到 $($records.Count) 条创建记录。"
+Write-Host '每一条都可以选择：  Y=还原  N=跳过  A=还原之后全部  Q=退出'
+Write-Host ''
+
+$restoreAll = $false
+$quit = $false
+$ok = 0
+$skipped = 0
+$failed = 0
+for ($i = 0; $i -lt $records.Count; $i++) {
+    $r = $records[$i]
+    $link = $r.link_path
+    $target = $r.target_path
+    $type = $r.type
+    $typeName = '文件'
+    if ($type -eq 'dir') { $typeName = '文件夹' }
+    Write-Host "[$($i + 1)/$($records.Count)] 类型: $typeName"
+    Write-Host "  符号链接: $link"
+    Write-Host "  真实数据: $target"
+
+    $doRestore = $restoreAll
+    if (-not $doRestore) {
+        $ans = (Read-Host '  还原这一项吗? (Y/N/A/Q)').Trim().ToUpper()
+        if ($ans -eq 'Q') {
+            $quit = $true
+        } elseif ($ans -eq 'A') {
+            $restoreAll = $true
+            $doRestore = $true
+        } elseif ($ans -eq 'Y') {
+            $doRestore = $true
+        } else {
+            Write-Host '  已跳过。' -ForegroundColor DarkGray
+            $skipped++
+        }
+    }
+    if ($quit -or -not $doRestore) { continue }
+
+    try {
+        $item = Get-Item -LiteralPath $link -Force -ErrorAction SilentlyContinue
+        if ($null -ne $item) {
+            if (($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -eq 0) {
+                Write-Host '  !! 原位置存在同名真实文件/文件夹（不是符号链接），为安全起见跳过。' -ForegroundColor Yellow
+                $failed++
+                continue
+            }
+            # 只删除链接本身，不会触碰 DiskForge 里的存档数据
+            if ($item.PSIsContainer) {
+                [System.IO.Directory]::Delete($item.FullName, $false)
+            } else {
+                [System.IO.File]::Delete($item.FullName)
+            }
+        }
+        if (-not (Test-Path -LiteralPath $target)) {
+            Write-Host '  !! 找不到 DiskForge 里的存档数据（可能已被移动或删除），跳过。' -ForegroundColor Red
+            $failed++
+            continue
+        }
+        if ($type -eq 'dir') {
+            Copy-Item -LiteralPath $target -Destination $link -Recurse -Force
+        } else {
+            $parent = Split-Path -Parent $link
+            if (-not (Test-Path -LiteralPath $parent)) { New-Item -ItemType Directory -Path $parent -Force | Out-Null }
+            Copy-Item -LiteralPath $target -Destination $link -Force
+        }
+        Write-Host '  已还原（DiskForge 里的存档副本保留）。' -ForegroundColor Green
+        $ok++
+    } catch {
+        Write-Host "  !! 还原失败: $($_.Exception.Message)" -ForegroundColor Red
+        $failed++
+    }
+}
+
+Write-Host ''
+Write-Host "完成：成功 $ok，跳过 $skipped，失败 $failed。"
+if ($failed -gt 0) {
+    Write-Host '有失败项：最常见的原因是权限不够，可以右键 DiskForge还原符号链接.bat，选择"以管理员身份运行"再试。' -ForegroundColor Yellow
+}
+Read-Host '按回车键退出' | Out-Null
+"##;
+
+/// 确保目标分区的 DiskForge 根目录下有一键还原脚本（bat + ps1）和带 BOM 的记录 CSV
+fn ensure_restore_scripts(base_dir: &str) -> Result<(), String> {
+    std::fs::create_dir_all(base_dir).map_err(|e| format!("创建 DiskForge 根目录失败: {e}"))?;
+    let bat_path = Path::new(base_dir).join(RESTORE_BAT_NAME);
+    if !bat_path.exists() {
+        // bat 内容保持纯 ASCII 并用 CRLF，避免任何代码页/编码问题
+        std::fs::write(&bat_path, RESTORE_BAT_CONTENT.replace('\n', "\r\n"))
+            .map_err(|e| format!("写还原脚本 {RESTORE_BAT_NAME} 失败: {e}"))?;
+        crate::applog::log(&format!("[file_ops] 已生成一键还原脚本: {}", bat_path.display()));
+    }
+    let ps1_path = Path::new(base_dir).join(RESTORE_PS1_NAME);
+    if !ps1_path.exists() {
+        // ps1 用 UTF-8 + BOM，Windows PowerShell 5.1 才能正确解析中文
+        let mut bytes: Vec<u8> = vec![0xEF, 0xBB, 0xBF];
+        bytes.extend_from_slice(RESTORE_PS1_CONTENT.replace('\n', "\r\n").as_bytes());
+        std::fs::write(&ps1_path, bytes).map_err(|e| format!("写还原脚本 {RESTORE_PS1_NAME} 失败: {e}"))?;
+        crate::applog::log(&format!("[file_ops] 已生成还原脚本: {}", ps1_path.display()));
+    }
+    let csv_path = Path::new(base_dir).join(RESTORE_CSV_NAME);
+    if !csv_path.exists() {
+        let mut bytes: Vec<u8> = vec![0xEF, 0xBB, 0xBF];
+        bytes.extend_from_slice(csv_line(&["created_at", "link_path", "target_path", "type"]).as_bytes());
+        std::fs::write(&csv_path, bytes).map_err(|e| format!("创建还原记录 CSV 失败: {e}"))?;
+    }
+    Ok(())
+}
+
+/// 把一次成功创建的符号链接追加写入还原记录，并确保还原脚本存在。
+/// 之后用户只要到目标分区 DiskForge 目录双击「DiskForge还原符号链接.bat」就能按记录还原。
+pub fn record_symlink_for_restore(link_path: &str, target_path: &str, is_dir: bool) -> Result<(), String> {
+    let Some(base_dir) = base_dir_from_target(target_path) else {
+        return Err(format!("无法从目标路径推导 DiskForge 根目录: {target_path}"));
+    };
+    let _guard = RESTORE_RECORD_LOCK.lock().map_err(|_| "还原记录锁异常".to_string())?;
+    ensure_restore_scripts(&base_dir)?;
+    let stamp = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
+    let line = csv_line(&[&stamp, link_path, target_path, if is_dir { "dir" } else { "file" }]);
+    use std::io::Write;
+    let mut f = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(Path::new(&base_dir).join(RESTORE_CSV_NAME))
+        .map_err(|e| format!("打开还原记录 CSV 失败: {e}"))?;
+    f.write_all(line.as_bytes()).map_err(|e| format!("写入还原记录 CSV 失败: {e}"))?;
+    crate::applog::log(&format!("[file_ops] 已记入还原记录: {link_path} -> {target_path}"));
+    Ok(())
+}
+
+/// 返回一键还原脚本（bat）的完整路径；目标路径不在 X:\DiskForge 下时返回 None。
+/// 供 UI 在创建成功后提示用户"去哪里找后悔药"。
+pub fn restore_bat_path_for(target_path: &str) -> Option<String> {
+    base_dir_from_target(target_path).map(|base| format!("{base}\\{RESTORE_BAT_NAME}"))
+}
+
+/// 在资源管理器中定位（选中）指定路径——"定位真实路径"功能用
+#[cfg(windows)]
+pub fn locate_in_explorer(path: &str) {
+    use std::os::windows::process::CommandExt;
+    if path.is_empty() { return; }
+    let arg = format!("/select,\"{path}\"");
+    crate::applog::log(&format!("[file_ops] 定位真实路径: explorer {arg}"));
+    if let Err(e) = std::process::Command::new("explorer").raw_arg(&arg).spawn() {
+        crate::applog::log(&format!("[file_ops] 定位真实路径失败 ({path}): {e}"));
+    }
+}
+#[cfg(not(windows))]
+pub fn locate_in_explorer(_path: &str) {}
+
+/// 解析符号链接/junction 的真实路径（沿链接链逐级解析，最多 16 层）。
+/// 返回 (真实路径, 是否为目录)；起点本身不是符号链接时返回 Err。
+pub fn resolve_symlink_target(path: &str) -> Result<(String, bool), String> {
+    let mut current = std::path::PathBuf::from(path);
+    let mut hops = 0usize;
+    loop {
+        let meta = std::fs::symlink_metadata(&current)
+            .map_err(|e| format!("无法读取 {}: {e}", current.display()))?;
+        if !meta.file_type().is_symlink() {
+            break;
+        }
+        hops += 1;
+        if hops > 16 {
+            return Err("符号链接嵌套超过 16 层（疑似循环链接），已停止解析".to_string());
+        }
+        let link_target = normalize_reparse_target(
+            std::fs::read_link(&current).map_err(|e| format!("读取链接目标失败: {e}"))?,
+        );
+        let next = if link_target.is_absolute() {
+            link_target
+        } else {
+            let parent = current.parent().map(|p| p.to_path_buf()).unwrap_or_default();
+            parent.join(link_target)
+        };
+        current = next;
+    }
+    if hops == 0 {
+        return Err("这一项本身不是符号链接".to_string());
+    }
+    let is_dir = std::fs::metadata(&current).map(|m| m.is_dir()).unwrap_or(false);
+    Ok((current.to_string_lossy().into_owned(), is_dir))
+}
+
+/// 去掉链接目标里的 \\?\ / \??\ 前缀（junction 和命令行创建的链接常见），转成普通可显示路径
+fn normalize_reparse_target(p: std::path::PathBuf) -> std::path::PathBuf {
+    let s = p.to_string_lossy();
+    let s = if let Some(rest) = s.strip_prefix(r"\\?\UNC\") {
+        format!(r"\\{rest}")
+    } else if let Some(rest) = s.strip_prefix(r"\\?\") {
+        rest.to_string()
+    } else if let Some(rest) = s.strip_prefix(r"\??\") {
+        rest.to_string()
+    } else {
+        s.into_owned()
+    };
+    std::path::PathBuf::from(s)
 }
 
 fn mirrored_folder_target_path(source_path: &str, base_dir: &str) -> Result<String, String> {

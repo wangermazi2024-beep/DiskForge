@@ -295,6 +295,7 @@ pub struct DiskForgeApp {
 
     pending_symlink_pick: Option<PendingSymlinkKind>,
     symlink_pick_drives: Vec<(char, Option<String>)>,
+    symlink_confirm: Option<(PendingSymlinkKind, char)>,
 
     lock_check_rx: Option<LockCheckJob>,
 
@@ -419,6 +420,7 @@ impl DiskForgeApp {
             status_message: None,
             pending_symlink_pick: None,
             symlink_pick_drives: Vec::new(),
+            symlink_confirm: None,
             lock_check_rx: None,
             layered_probe: None,
             find_open: false,
@@ -456,6 +458,9 @@ impl eframe::App for DiskForgeApp {
         }
         if self.pending_symlink_pick.is_some() {
             self.show_symlink_target_picker_modal(ui.ctx());
+        }
+        if self.symlink_confirm.is_some() {
+            self.show_symlink_confirm_modal(ui.ctx());
         }
         if self.lock_check_result.is_some() {
             self.show_lock_check_modal(ui.ctx());
@@ -656,6 +661,7 @@ impl DiskForgeApp {
         let modal_open = self.picker.is_some()
             || self.pending_delete.is_some()
             || self.pending_symlink_pick.is_some()
+            || self.symlink_confirm.is_some()
             || self.lock_check_result.is_some()
             || self.layered_probe.is_some()
             || self.about.is_some();
@@ -1336,6 +1342,23 @@ impl DiskForgeApp {
             }
             TreeAction::RequestCreateSymlinkGroup { abs_path, name } => {
                 self.start_symlink_group(tab_idx, abs_path, name);
+            }
+            TreeAction::RequestResolveSymlink { full_path, name } => {
+                match crate::file_ops::resolve_symlink_target(&full_path) {
+                    Ok((real_path, _is_dir)) => {
+                        crate::applog::log(&format!("[app] 解析符号链接真实路径: {full_path} -> {real_path}"));
+                        if std::path::Path::new(&real_path).exists() {
+                            crate::file_ops::locate_in_explorer(&real_path);
+                            self.status_message = Some(StatusMsg::info(format!("「{name}」的真实路径: {real_path}（已在资源管理器中定位）")));
+                        } else {
+                            self.status_message = Some(StatusMsg::error(format!("「{name}」指向 {real_path}，但这个目标已不存在（链接已失效）")));
+                        }
+                    }
+                    Err(e) => {
+                        crate::applog::log(&format!("[app] 解析符号链接真实路径失败 ({full_path}): {e}"));
+                        self.status_message = Some(StatusMsg::error(format!("无法解析「{name}」的真实路径: {e}")));
+                    }
+                }
             }
             TreeAction::RequestRescan(pi) => {
                 if in_tab_tree {
@@ -2227,9 +2250,71 @@ impl DiskForgeApp {
             });
         if let Some(drive) = chosen {
             let kind = self.pending_symlink_pick.take().unwrap();
-            self.launch_symlink_job(kind, drive);
+            // 选好分区后不直接动手，先弹出二次确认（警告 + 指引一键还原脚本）
+            self.symlink_confirm = Some((kind, drive));
         } else if cancel {
             self.pending_symlink_pick = None;
+        }
+    }
+
+    fn show_symlink_confirm_modal(&mut self, ctx: &egui::Context) {
+        let Some((kind, drive)) = &self.symlink_confirm else { return };
+        let name = match kind {
+            PendingSymlinkKind::Single { name, .. } | PendingSymlinkKind::Group { name, .. } => name.clone(),
+        };
+        let base_dir = crate::file_ops::diskforge_base_dir(*drive);
+        let mut confirm = false;
+        let mut cancel = false;
+        egui::Window::new("⚠ 创建符号链接前请再次确认")
+            .id(egui::Id::new("symlink_confirm"))
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+            .show(ctx, |ui| {
+                ui.set_min_width(460.0);
+                ui.horizontal(|ui| {
+                    ui.label("确定要为");
+                    ui.label(egui::RichText::new(&name).strong());
+                    ui.label("创建符号链接吗？");
+                });
+                ui.label(
+                    egui::RichText::new(format!("真实数据将存放到 {base_dir} 目录下，原位置只留下一个符号链接。"))
+                        .size(11.0)
+                        .color(Color32::from_rgb(0xA0, 0xA0, 0xA0)),
+                );
+                ui.add_space(6.0);
+                ui.separator();
+                ui.add_space(6.0);
+                ui.label(
+                    egui::RichText::new("⚠ 请务必了解：只有个别软件不兼容符号链接，迁移后可能无法正常运行。")
+                        .color(crate::theme::STATUS_ERROR_RED),
+                );
+                ui.label("例如把浏览器的核心 dll 单独迁移，可能导致浏览器打不开网页。");
+                ui.label(RichText::new("建议尽量按\"整个文件夹\"迁移，而不是单个文件——整体迁移更不容易破坏软件结构。").color(Color32::from_rgb(0xF5, 0xA6, 0x23)));
+                ui.add_space(6.0);
+                ui.separator();
+                ui.add_space(6.0);
+                ui.label(
+                    egui::RichText::new(format!(
+                        "万一之后软件出现异常，可以随时到 {base_dir} 目录双击「DiskForge还原符号链接.bat」，按创建记录一键还原成真实文件（免费后悔药）。"
+                    ))
+                    .color(Color32::from_rgb(0x34, 0xC7, 0x59)),
+                );
+                ui.add_space(10.0);
+                ui.horizontal(|ui| {
+                    if ui.add(egui::Button::new(RichText::new("✓ 我已了解，仍然继续创建").strong())).clicked() {
+                        confirm = true;
+                    }
+                    if ui.button("取消").clicked() {
+                        cancel = true;
+                    }
+                });
+            });
+        if confirm {
+            let (kind, drive) = self.symlink_confirm.take().unwrap();
+            self.launch_symlink_job(kind, drive);
+        } else if cancel {
+            self.symlink_confirm = None;
         }
     }
 
@@ -2251,14 +2336,22 @@ impl DiskForgeApp {
                         self.remove_node_after_success(request.source, &request.abs_path, None);
                     }
                 }
-                self.status_message = Some(StatusMsg::info(match outcome {
+                let text = match &outcome {
                     SymlinkOutcome::Single { target_path } => format!("已创建符号链接: {} → {target_path}", request.name),
                     SymlinkOutcome::Group { target_path, member_count, total_count } => format!(
                         "{} 共 {total_count} 份，已将其中 {member_count} 份统一指向 {target_path}{}",
                         request.name,
                         if member_count < total_count { "（有部分副本处理失败，详情见日志）" } else { "" },
                     ),
-                }));
+                };
+                let restore_note = match &outcome {
+                    SymlinkOutcome::Single { target_path } | SymlinkOutcome::Group { target_path, .. } => {
+                        crate::file_ops::restore_bat_path_for(target_path)
+                            .map(|bat| format!("；万一相关软件运行异常，可到目标分区双击 {bat} 一键还原成真实文件"))
+                            .unwrap_or_default()
+                    }
+                };
+                self.status_message = Some(StatusMsg::info(format!("{text}{restore_note}")));
             }
             Err(e) => {
                 crate::applog::log(&format!("[app] 创建符号链接失败 ({}): {e}", request.name));

@@ -222,7 +222,7 @@ pub fn show(ui: &mut egui::Ui, root: &Node, selected: &Option<NodePath>, view: &
                                 resp.context_menu(|ui| context_menu_group(ui, &fr.abs_path, &n.name, &action_request));
                             }
                         } else {
-                            resp.context_menu(|ui| context_menu(ui, &n.name, &full_path(), &fr.abs_path, &action_request));
+                            resp.context_menu(|ui| context_menu(ui, n.is_reparse_point(), &n.name, &full_path(), &fr.abs_path, &action_request));
                         }
                     });
                     row.col(|ui| {
@@ -231,7 +231,7 @@ pub fn show(ui: &mut egui::Ui, root: &Node, selected: &Option<NodePath>, view: &
                             human_size(n.logical_size), egui::FontId::proportional(12.0), Color32::from_rgb(0xD0, 0xD0, 0xD0));
                         dim_if_hidden(ui, rect);
                         handle_click(&resp);
-                        if !is_group { resp.context_menu(|ui| context_menu(ui, &n.name, &full_path(), &fr.abs_path, &action_request)); }
+                        if !is_group { resp.context_menu(|ui| context_menu(ui, n.is_reparse_point(), &n.name, &full_path(), &fr.abs_path, &action_request)); }
                     });
                     row.col(|ui| {
                         let (rect, resp) = paint_bg_and_sense(ui);
@@ -241,7 +241,7 @@ pub fn show(ui: &mut egui::Ui, root: &Node, selected: &Option<NodePath>, view: &
                         }
                         dim_if_hidden(ui, rect);
                         handle_click(&resp);
-                        if !is_group { resp.context_menu(|ui| context_menu(ui, &n.name, &full_path(), &fr.abs_path, &action_request)); }
+                        if !is_group { resp.context_menu(|ui| context_menu(ui, n.is_reparse_point(), &n.name, &full_path(), &fr.abs_path, &action_request)); }
                     });
                     row.col(|ui| {
                         let (rect, resp) = paint_bg_and_sense(ui);
@@ -254,7 +254,7 @@ pub fn show(ui: &mut egui::Ui, root: &Node, selected: &Option<NodePath>, view: &
                         }
                         dim_if_hidden(ui, rect);
                         handle_click(&resp);
-                        if !is_group { resp.context_menu(|ui| context_menu(ui, &n.name, &full_path(), &fr.abs_path, &action_request)); }
+                        if !is_group { resp.context_menu(|ui| context_menu(ui, n.is_reparse_point(), &n.name, &full_path(), &fr.abs_path, &action_request)); }
                     });
                 });
                 if let Some(idx) = clicked_row.get() {
@@ -333,7 +333,7 @@ fn context_menu_group(ui: &mut egui::Ui, abs_path: &NodePath, name: &str, action
     }
 }
 
-fn context_menu(ui: &mut egui::Ui, name: &str, full_path: &str, abs_path: &NodePath, action_request: &Cell<Option<TreeAction>>) {
+fn context_menu(ui: &mut egui::Ui, is_reparse: bool, name: &str, full_path: &str, abs_path: &NodePath, action_request: &Cell<Option<TreeAction>>) {
     ui.set_min_width(180.0);
     if ui.button("📂 打开所在文件夹").clicked() {
         open_in_explorer_select(full_path);
@@ -350,6 +350,20 @@ fn context_menu(ui: &mut egui::Ui, name: &str, full_path: &str, abs_path: &NodeP
     ui.separator();
     if ui.button("ℹ 属性").clicked() {
         crate::file_ops::open_properties(full_path);
+        ui.close();
+    }
+    let resolve_btn = egui::Button::new("🎯 定位真实路径");
+    let resolve_resp = ui.add_enabled(is_reparse, resolve_btn);
+    let resolve_resp = if is_reparse {
+        resolve_resp.on_hover_text("解析这个符号链接/junction 指向的真实位置，并在资源管理器里定位它")
+    } else {
+        resolve_resp.on_disabled_hover_text("只有符号链接/junction/挂载点才有\"真实路径\"，普通文件没有")
+    };
+    if resolve_resp.clicked() {
+        action_request.set(Some(TreeAction::RequestResolveSymlink {
+            name: name.to_string(),
+            full_path: full_path.to_string(),
+        }));
         ui.close();
     }
     if ui.button("🔍 检测占用").clicked() {
