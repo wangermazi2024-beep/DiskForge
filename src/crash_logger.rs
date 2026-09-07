@@ -8,16 +8,48 @@
 //! 这里用 SetUnhandledExceptionFilter 注册最后一道兜底（游戏引擎、浏览器的崩溃
 //! 上报用的就是同一套机制）：进程被系统杀死之前，把异常码、发生地址、线程 ID
 //! 写进诊断日志并强制 flush 落盘。
+//!
+//! windows-sys 0.59 精简掉了 Diagnostics 模块，所以 kernel32 的这一个导出函数
+//! 和两个结构体在这里手写声明（微软公开且几十年稳定的 ABI，与 file_ops.rs 里
+//! 手写 IFileOperation vtable 是同一套做法）。
 
 #[cfg(windows)]
 mod imp {
+    use std::ffi::c_void;
     use std::fs::OpenOptions;
     use std::io::Write;
 
-    use windows_sys::Win32::Diagnostics::Debug::{
-        SetUnhandledExceptionFilter, EXCEPTION_POINTERS, LPTOP_LEVEL_EXCEPTION_FILTER,
-    };
     use windows_sys::Win32::System::Threading::GetCurrentThreadId;
+
+    /// EXCEPTION_RECORD 的 64 位等价布局（字段按 usize 描述指针宽度，
+    /// x64 上与 winnt.h 的 EXCEPTION_RECORD64 完全一致）。只读前几个字段。
+    #[repr(C)]
+    #[allow(non_snake_case)] // 字段名与 winnt.h 的 EXCEPTION_RECORD64 保持一致，便于对照
+    struct ExceptionRecord {
+        ExceptionCode: u32,
+        ExceptionFlags: u32,
+        ExceptionRecord: *const ExceptionRecord,
+        ExceptionAddress: *const c_void,
+        NumberParameters: u32,
+        __padding: u32,
+        ExceptionInformation: [usize; 15],
+    }
+
+    /// winnt.h 的 EXCEPTION_POINTERS
+    #[repr(C)]
+    #[allow(non_snake_case)]
+    struct ExceptionPointers {
+        ExceptionRecord: *const ExceptionRecord,
+        ContextRecord: *const c_void,
+    }
+
+    /// unhandledExceptionFilter 的函数指针类型（kernel32 导出）
+    type TopLevelFilter = Option<unsafe extern "system" fn(*const ExceptionPointers) -> i32>;
+
+    // edition 2024 要求 extern 块显式标 unsafe
+    unsafe extern "system" {
+        fn SetUnhandledExceptionFilter(lpTopLevelExceptionFilter: TopLevelFilter) -> TopLevelFilter;
+    }
 
     /// 常见 SEH 异常码 -> 面向用户的中文说明
     fn describe(code: u32) -> &'static str {
@@ -50,15 +82,19 @@ mod imp {
     }
 
     /// 返回 EXCEPTION_EXECUTE_HANDLER(1)：写完日志后让进程按默认方式终止。
-    unsafe extern "system" fn filter(info: *const EXCEPTION_POINTERS) -> i32 {
-        if info.is_null() || (*info).ExceptionRecord.is_null() {
-            write_crash_log("==== CRASH 发生系统级异常，但异常信息不可读 ====");
-            return 1;
-        }
-        let rec = &*(*info).ExceptionRecord;
-        let code = rec.ExceptionCode as u32;
+    unsafe extern "system" fn filter(info: *const ExceptionPointers) -> i32 {
+        // edition 2024 要求 unsafe fn 体内的裸指针解引用显式包 unsafe 块
+        let rec = unsafe {
+            if info.is_null() || (*info).ExceptionRecord.is_null() {
+                write_crash_log("==== CRASH 发生系统级异常，但异常信息不可读 ====");
+                return 1;
+            }
+            // SAFETY: 系统在调用未处理异常回调时保证 info 与其 ExceptionRecord 有效
+            &*(*info).ExceptionRecord
+        };
+        let code = rec.ExceptionCode;
         let addr = rec.ExceptionAddress as usize;
-        let tid = GetCurrentThreadId();
+        let tid = unsafe { GetCurrentThreadId() };
         let mut line = format!(
             "==== CRASH [线程 ID {tid}] 异常 0x{code:08X}（{}），发生地址 0x{addr:016X}",
             describe(code)
@@ -83,7 +119,7 @@ mod imp {
 
     pub fn install() {
         unsafe {
-            SetUnhandledExceptionFilter(Some(filter as LPTOP_LEVEL_EXCEPTION_FILTER));
+            SetUnhandledExceptionFilter(Some(filter));
         }
         crate::applog::log(
             "[main] 系统级崩溃日志已安装（panic 之外的 SEH 异常也会写入 diskforge_log.txt）",

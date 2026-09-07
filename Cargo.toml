@@ -1,6 +1,6 @@
 ﻿[package]
 name = "diskforge"
-version = "0.1.4"
+version = "0.1.5"
 edition = "2024"
 description = "DiskForge — 免费的 Windows NTFS 磁盘空间与文件分析器"
 authors = ["WMS <wumingshifn@gmail.com>"]
@@ -49,11 +49,20 @@ regex = "1"
 memchr = "2"
 
 [target.'cfg(windows)'.dependencies]
+# 回收站删除（IFileOperation + IFileOperationProgressSink 进度回调）用官方
+# windows 绑定：ProgressSink 是 COM 回调接口，用 implement 宏实现而不是手写
+# vtable（手写槽位顺序极易出错）。其余底层 API 仍用轻量的 windows-sys。
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_System_Com",
+    "Win32_UI_Shell",
+] }
+# implement 宏展开会引用 ::windows_core 路径，需要直接依赖
+windows-core = "0.62"
 windows-sys = { version = "0.59", features = [
     "Win32_Foundation",
     "Win32_Storage_FileSystem",
     "Win32_System_Com",
-    "Win32_System_Diagnostics_Debug",
     "Win32_System_IO",
     "Win32_System_Ioctl",
     "Win32_System_LibraryLoader",
